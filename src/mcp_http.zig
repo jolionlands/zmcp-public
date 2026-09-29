@@ -21,6 +21,9 @@
 //!   * Binds loopback only unless ZMCP_HTTP_ALLOW_REMOTE=1.
 //!   * ZMCP_HTTP_TOKEN set -> every endpoint except /healthz needs
 //!     `Authorization: Bearer <token>` (constant-time compare), else 401.
+//!     A token that is set but empty is a startup error (never "no auth"),
+//!     and a non-loopback bind without a token is refused unless
+//!     ZMCP_HTTP_INSECURE=1 explicitly accepts unauthenticated remote access.
 //!   * Origin (and, on loopback binds, Host) headers are validated against
 //!     loopback names plus the ZMCP_HTTP_ORIGINS allowlist (comma separated
 //!     origins or hosts) to stop DNS rebinding; violations get 403. Requests
@@ -56,9 +59,11 @@ pub const EnvStrings = struct {
     token: ?[]u8 = null,
     origins: ?[]u8 = null,
     max_body: ?[]u8 = null,
+    /// ZMCP_HTTP_INSECURE: "1" allows a non-loopback bind without a token.
+    insecure: ?[]u8 = null,
 
     pub fn deinit(self: *EnvStrings, a: Allocator) void {
-        inline for (.{ "allow_remote", "token", "origins", "max_body" }) |f| {
+        inline for (.{ "allow_remote", "token", "origins", "max_body", "insecure" }) |f| {
             if (@field(self, f)) |v| a.free(v);
             @field(self, f) = null;
         }
@@ -884,6 +889,19 @@ fn streamLoop(l: *Listener, conn: *Conn, w: *Io.Writer, legacy_id: ?[id_len]u8) 
     }
 }
 
+/// Startup auth policy (pure). `token_env` is the raw ZMCP_HTTP_TOKEN value
+/// (null = unset). Returns the trimmed token to enforce, or null for "no
+/// auth", which is only acceptable on loopback binds (or with `insecure`).
+pub fn authPolicy(token_env: ?[]const u8, loopback: bool, insecure: bool) error{ EmptyToken, TokenRequired }!?[]const u8 {
+    if (token_env) |v| {
+        const t = std.mem.trim(u8, v, " \t\r\n");
+        if (t.len == 0) return error.EmptyToken;
+        return t;
+    }
+    if (!loopback and !insecure) return error.TokenRequired;
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Entry point used by mcp.run
 // ---------------------------------------------------------------------------
@@ -898,10 +916,7 @@ pub fn serve(
 ) !void {
     var cfg: Config = .{};
     if (env.allow_remote) |v| cfg.allow_remote = std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1");
-    if (env.token) |v| {
-        const t = std.mem.trim(u8, v, " \t\r\n");
-        if (t.len > 0) cfg.token = t;
-    }
+    const insecure = if (env.insecure) |v| std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "1") else false;
     if (env.max_body) |v| {
         if (std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10)) |n| {
             if (n > 0) cfg.max_body = n;
@@ -923,8 +938,15 @@ pub fn serve(
         std.debug.print("{s}: refusing non-loopback bind {s}; set ZMCP_HTTP_ALLOW_REMOTE=1 (and ZMCP_HTTP_TOKEN) to expose it\n", .{ server_name, addr_text });
         return error.NonLoopbackRefused;
     };
-    if (cfg.allow_remote and cfg.token == null and !isLoopbackAddress(addr)) {
-        std.debug.print("{s}: WARNING remote bind without ZMCP_HTTP_TOKEN; anyone who can reach it can call every tool\n", .{server_name});
+    cfg.token = authPolicy(env.token, isLoopbackAddress(addr), insecure) catch |e| {
+        switch (e) {
+            error.EmptyToken => std.debug.print("{s}: ZMCP_HTTP_TOKEN is set but empty; refusing to start without authentication (unset it for a loopback-only server, or set a real token)\n", .{server_name}),
+            error.TokenRequired => std.debug.print("{s}: refusing non-loopback bind {s} without ZMCP_HTTP_TOKEN; set a token, or ZMCP_HTTP_INSECURE=1 to knowingly serve every tool to anyone who can reach it\n", .{ server_name, addr_text }),
+        }
+        return e;
+    };
+    if (cfg.token == null and !isLoopbackAddress(addr)) {
+        std.debug.print("{s}: WARNING ZMCP_HTTP_INSECURE=1: remote bind without a token; anyone who can reach it can call every tool\n", .{server_name});
     }
 
     const l = try Listener.init(gpa, io, cfg, backend, addr);
@@ -1082,6 +1104,21 @@ test "origin: rejects rebinding origins, allows loopback and allowlist" {
     cfg.allow_remote = true;
     g.host = "myhost.lan:8787";
     try std.testing.expect(decide(&cfg, &s, io, g) == .legacy_sse);
+}
+
+test "authPolicy: empty token is an error, remote needs a token or explicit insecure" {
+    // Set-but-empty (or blank) is never "no auth", even with insecure.
+    try std.testing.expectError(error.EmptyToken, authPolicy("", true, false));
+    try std.testing.expectError(error.EmptyToken, authPolicy("  \r\n", false, false));
+    try std.testing.expectError(error.EmptyToken, authPolicy("", false, true));
+    // Loopback without a token keeps working.
+    try std.testing.expect((try authPolicy(null, true, false)) == null);
+    // Remote without a token is refused unless explicitly insecure.
+    try std.testing.expectError(error.TokenRequired, authPolicy(null, false, false));
+    try std.testing.expect((try authPolicy(null, false, true)) == null);
+    // A real token is trimmed and enforced everywhere.
+    try std.testing.expectEqualStrings("s3cret", (try authPolicy(" s3cret\n", false, false)).?);
+    try std.testing.expectEqualStrings("s3cret", (try authPolicy("s3cret", true, false)).?);
 }
 
 test "bind policy: loopback by default, remote only when allowed" {

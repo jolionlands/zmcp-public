@@ -127,7 +127,7 @@ fn getInt(args: std.json.Value, key: []const u8, default: i64) i64 {
     const v = args.object.get(key) orelse return default;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (std.math.isFinite(f) and @abs(f) < 1e15) @as(i64, @intFromFloat(f)) else default,
         else => default,
     };
 }
@@ -380,4 +380,19 @@ fn handleSearchPapers(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value
     }
     const body = try jsonPretty(alloc, .{ .array = rows });
     return .{ .text = try std.fmt.allocPrint(alloc, "{d} paper(s):\n{s}", .{ rows.items.len, body }) };
+}
+
+test "getInt: non-finite and huge floats fall back to default" {
+    const alloc = std.testing.allocator;
+    const vals = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 1e300 };
+    for (vals) |f| {
+        var mm: std.json.ObjectMap = .empty;
+        defer mm.deinit(alloc);
+        try mm.put(alloc, "limit", .{ .float = f });
+        try std.testing.expectEqual(@as(i64, 20), getInt(.{ .object = mm }, "limit", 20));
+    }
+    var mm: std.json.ObjectMap = .empty;
+    defer mm.deinit(alloc);
+    try mm.put(alloc, "limit", .{ .float = 7.9 });
+    try std.testing.expectEqual(@as(i64, 7), getInt(.{ .object = mm }, "limit", 20));
 }

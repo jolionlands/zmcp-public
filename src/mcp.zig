@@ -15,6 +15,7 @@
 //!   ZMCP_TOOLS=a,b,git_*               allowlist (trailing-* globs); others off
 //!   ZMCP_TOOLS_DENY=x,y*               denylist, wins over the allowlist
 //!   ZMCP_READONLY=1                    keep only tools marked read_only
+//!   ZMCP_NO_DESTRUCTIVE=1              hide and refuse tools marked destructive
 //!   ZMCP_HTTP=host:port                serve streamable HTTP + SSE instead of
 //!                                      stdio (see mcp_http.zig for the rest)
 
@@ -108,7 +109,7 @@ pub const CallHook = *const fn (
 pub const Extras = struct {
     /// Replace the exposure mode read from ZMCP_TOOL_MODE.
     mode: ?ToolMode = null,
-    /// Ignore ZMCP_TOOLS / ZMCP_TOOLS_DENY / ZMCP_READONLY for this table
+    /// Ignore ZMCP_TOOLS / ZMCP_TOOLS_DENY / ZMCP_READONLY / ZMCP_NO_DESTRUCTIVE for this table
     /// (the caller slices its own table).
     ignore_slice_env: bool = false,
     hook: ?CallHook = null,
@@ -147,9 +148,11 @@ pub const Slice = struct {
     deny: []const []const u8 = &.{},
     /// Keep only tools with `read_only = true`.
     read_only: bool = false,
+    /// Drop tools with `destructive = true` (ZMCP_NO_DESTRUCTIVE=1).
+    no_destructive: bool = false,
 
     pub fn isEmpty(self: Slice) bool {
-        return self.allow.len == 0 and self.deny.len == 0 and !self.read_only;
+        return self.allow.len == 0 and self.deny.len == 0 and !self.read_only and !self.no_destructive;
     }
 };
 
@@ -166,6 +169,7 @@ pub const DisableReason = enum {
     allow,
     deny,
     readonly,
+    no_destructive,
 
     /// Text for the JSON-RPC error / tool result.
     pub fn message(self: DisableReason) []const u8 {
@@ -173,6 +177,7 @@ pub const DisableReason = enum {
             .allow => "tool disabled by ZMCP_TOOLS",
             .deny => "tool disabled by ZMCP_TOOLS_DENY",
             .readonly => "tool disabled by ZMCP_READONLY",
+            .no_destructive => "tool disabled by ZMCP_NO_DESTRUCTIVE",
         };
     }
 };
@@ -193,11 +198,13 @@ fn matchesAny(patterns: []const []const u8, name: []const u8) bool {
 }
 
 /// Deny beats allow; an allowlist hides everything it does not name;
-/// read-only hides tools not marked read_only.
+/// read-only hides tools not marked read_only; no_destructive hides tools
+/// marked destructive.
 pub fn disableReason(sl: Slice, t: ToolDef) ?DisableReason {
     if (matchesAny(sl.deny, t.name)) return .deny;
     if (sl.allow.len > 0 and !matchesAny(sl.allow, t.name)) return .allow;
     if (sl.read_only and !t.read_only) return .readonly;
+    if (sl.no_destructive and t.destructive) return .no_destructive;
     return null;
 }
 
@@ -294,7 +301,7 @@ test "userAgentWith formats repo url and optional contact" {
 /// point into.
 pub const LoadedOptions = struct {
     opts: Options,
-    texts: [5]?[]u8,
+    texts: [6]?[]u8,
     allow: []const []const u8,
     deny: []const []const u8,
 
@@ -306,10 +313,10 @@ pub const LoadedOptions = struct {
 };
 
 /// Options from ZMCP_TOOL_MODE / ZMCP_MAX_RESULT_BYTES / ZMCP_TOOLS /
-/// ZMCP_TOOLS_DENY / ZMCP_READONLY.
+/// ZMCP_TOOLS_DENY / ZMCP_READONLY / ZMCP_NO_DESTRUCTIVE.
 pub fn loadOptions(allocator: std.mem.Allocator, io: Io) !LoadedOptions {
-    var texts: [5]?[]u8 = undefined;
-    const keys = [_][]const u8{ "ZMCP_TOOL_MODE", "ZMCP_MAX_RESULT_BYTES", "ZMCP_TOOLS", "ZMCP_TOOLS_DENY", "ZMCP_READONLY" };
+    var texts: [6]?[]u8 = undefined;
+    const keys = [_][]const u8{ "ZMCP_TOOL_MODE", "ZMCP_MAX_RESULT_BYTES", "ZMCP_TOOLS", "ZMCP_TOOLS_DENY", "ZMCP_READONLY", "ZMCP_NO_DESTRUCTIVE" };
     for (keys, 0..) |k, i| texts[i] = envAlloc(allocator, io, k);
     errdefer for (texts) |t| if (t) |m| allocator.free(m);
     const allow = try parseNameList(allocator, texts[2]);
@@ -319,7 +326,7 @@ pub fn loadOptions(allocator: std.mem.Allocator, io: Io) !LoadedOptions {
         .opts = .{
             .mode = parseToolMode(texts[0]),
             .max_result_bytes = parseByteLimit(texts[1]),
-            .slice = .{ .allow = allow, .deny = deny, .read_only = parseFlag(texts[4]) },
+            .slice = .{ .allow = allow, .deny = deny, .read_only = parseFlag(texts[4]), .no_destructive = parseFlag(texts[5]) },
         },
         .texts = texts,
         .allow = allow,
@@ -506,15 +513,16 @@ fn runHttp(ctx: *Ctx, io: Io, addr_text: []const u8) !void {
     const allocator = ctx.gpa;
     var env = http.EnvStrings{};
     defer env.deinit(allocator);
-    const keys = .{ "ZMCP_HTTP_ALLOW_REMOTE", "ZMCP_HTTP_TOKEN", "ZMCP_HTTP_ORIGINS", "ZMCP_HTTP_MAX_BODY" };
+    const keys = .{ "ZMCP_HTTP_ALLOW_REMOTE", "ZMCP_HTTP_TOKEN", "ZMCP_HTTP_ORIGINS", "ZMCP_HTTP_MAX_BODY", "ZMCP_HTTP_INSECURE" };
     env.allow_remote = envAlloc(allocator, io, keys[0]);
     env.token = envAlloc(allocator, io, keys[1]);
     env.origins = envAlloc(allocator, io, keys[2]);
     env.max_body = envAlloc(allocator, io, keys[3]);
+    env.insecure = envAlloc(allocator, io, keys[4]);
     http.serve(allocator, io, addr_text, env, .{ .ctx = ctx, .call = httpCall }, ctx.server.name) catch |err| switch (err) {
         // Configuration mistakes were already explained on stderr; exit
         // without a stack trace.
-        error.InvalidAddress, error.NonLoopbackRefused => std.process.exit(2),
+        error.InvalidAddress, error.NonLoopbackRefused, error.EmptyToken, error.TokenRequired => std.process.exit(2),
         else => return err,
     };
 }
@@ -1892,6 +1900,24 @@ test "slice: readonly keeps only read_only tools and composes with allow/deny" {
     try expectListed(.{ .slice = .{ .read_only = true } }, "git_status,git_log,git_diff,git_diff_stat");
     try expectListed(.{ .slice = .{ .read_only = true, .allow = &.{ "git_log", "git_push" } } }, "git_log");
     try expectListed(.{ .slice = .{ .read_only = true, .deny = &.{"git_diff*"} } }, "git_status,git_log");
+}
+
+test "slice: no_destructive hides destructive tools, composes, and is refused at call time" {
+    try expectListed(.{ .slice = .{ .no_destructive = true } }, "git_status,git_log,git_diff,git_diff_stat,echo");
+    try expectListed(.{ .slice = .{ .no_destructive = true, .read_only = true } }, "git_status,git_log,git_diff,git_diff_stat");
+    try expectListed(.{ .slice = .{ .no_destructive = true, .deny = &.{"git_diff*"} } }, "git_status,git_log,echo");
+    try std.testing.expect(!(Slice{ .no_destructive = true }).isEmpty());
+    try std.testing.expect((Slice{}).isEmpty());
+    try std.testing.expectEqual(DisableReason.no_destructive, disableReason(.{ .no_destructive = true }, mk("x", false, true)).?);
+    try std.testing.expect(disableReason(.{ .no_destructive = true }, mk("x", true, false)) == null);
+    const alloc = std.testing.allocator;
+    const out = try runWith(alloc, &slice_tools, .{ .slice = .{ .no_destructive = true } }, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"git_push\"}}");
+    defer alloc.free(out);
+    try expectContains(out, "tool disabled by ZMCP_NO_DESTRUCTIVE");
+    // Off by default: the destructive tool still runs.
+    const on = try runWith(alloc, &slice_tools, .{}, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"git_push\"}}");
+    defer alloc.free(on);
+    try expectContains(on, "\"text\":\"ran\"");
 }
 
 test "slice: annotations emitted for hinted tools in every mode" {

@@ -669,20 +669,30 @@ pub const Call = struct {
         return std.fmt.allocPrint(self.alloc, fmt, args) catch "";
     }
 
+    /// Parse caller-supplied GraphQL variables: must be one JSON object and
+    /// nothing else. The parsed value is re-serialized by the caller, so raw
+    /// text (e.g. `{}, "query": "mutation ..."`) can never be spliced into
+    /// the request body.
+    fn parseVariables(self: *Call, vs: []const u8) ToolError!std.json.Value {
+        const v = std.json.parseFromSliceLeaky(std.json.Value, self.alloc, vs, .{}) catch
+            return fail(self.alloc, "GraphQL variables must be a valid JSON object", .{});
+        if (v != .object) return fail(self.alloc, "GraphQL variables must be a JSON object", .{});
+        return v;
+    }
+
     /// Minimal GraphQL POST. `variables` is a JSON object string (or null).
     /// Returns the `data` object; GraphQL `errors` become a tool error.
     pub fn graphql(self: *Call, query: []const u8, variables: ?[]const u8) ToolError!std.json.Value {
         const tok = genv.token() orelse return fail(self.alloc, "No GitHub token: set GITHUB_TOKEN (or GITHUB_PERSONAL_ACCESS_TOKEN / GH_TOKEN) in the server environment.", .{});
         const ep = genv.endpoints(self.alloc) catch return fail(self.alloc, "GITHUB_API_URL / GITHUB_HOST is invalid: use https://host (http only for localhost)", .{});
+        const vars: ?std.json.Value = if (variables) |vs| try self.parseVariables(vs) else null;
         const o = Out.init(self.alloc) catch return error.ToolFail;
         o.js.beginObject() catch return error.ToolFail;
         o.js.objectField("query") catch return error.ToolFail;
         o.js.write(query) catch return error.ToolFail;
-        if (variables) |vs| {
+        if (vars) |v| {
             o.js.objectField("variables") catch return error.ToolFail;
-            o.js.beginWriteRaw() catch return error.ToolFail;
-            o.sw.writer.writeAll(vs) catch return error.ToolFail;
-            o.js.endWriteRaw();
+            o.js.write(v) catch return error.ToolFail;
         }
         o.js.endObject() catch return error.ToolFail;
         const r = try self.dispatch(.{ .method = .POST, .url = ep.graphql, .token = tok, .body = o.text() });
@@ -841,3 +851,24 @@ pub const testing_support = struct {
         genv.test_env = null;
     }
 };
+
+test "graphql variables: only a single JSON object is accepted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var c: Call = .{ .alloc = arena.allocator(), .io = std.testing.io, .args = .null };
+    const good = try c.parseVariables("{\"x\":1,\"s\":\"a\\\"b\"}");
+    try std.testing.expectEqual(@as(usize, 2), good.object.count());
+    // Injection attempts: trailing members/keys, arrays, scalars, junk.
+    const bad = [_][]const u8{
+        "{}, \"query\": \"mutation { deleteRepository }\"",
+        "{\"a\":1}, \"query\":\"x\"",
+        "{\"a\":1}}, \"query\":\"x\", \"z\":{",
+        "[1]",
+        "\"str\"",
+        "null",
+        "1",
+        "",
+        "{\"a\":",
+    };
+    for (bad) |b| try std.testing.expectError(error.ToolFail, c.parseVariables(b));
+}

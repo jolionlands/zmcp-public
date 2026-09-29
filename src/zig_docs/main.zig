@@ -334,7 +334,16 @@ fn handleFmtCheck(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.T
     return .{ .text = try joinedOutput(alloc, code, result.stdout, result.stderr) };
 }
 
+fn runAllowed(alloc: std.mem.Allocator) bool {
+    const v = envOwned(alloc, "ZMCP_ZIG_DOCS_ALLOW_RUN") orelse return false;
+    defer alloc.free(v);
+    return std.mem.eql(u8, v, "1");
+}
+
+const run_disabled_msg = "this tool compiles and executes Zig code (build.zig or test blocks) and is disabled by default; set ZMCP_ZIG_DOCS_ALLOW_RUN=1 to enable it";
+
 fn handleBuild(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
+    if (!runAllowed(alloc)) return .{ .text = run_disabled_msg, .is_error = true };
     const cwd = getStr(args, "cwd") orelse return .{ .text = "cwd is required", .is_error = true };
     const step = getStr(args, "step");
     const extra = try getStrArray(args, "extra_args", alloc);
@@ -354,6 +363,7 @@ fn handleBuild(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.Tool
 }
 
 fn handleTestFile(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
+    if (!runAllowed(alloc)) return .{ .text = run_disabled_msg, .is_error = true };
     const path = getStr(args, "path") orelse return .{ .text = "path is required", .is_error = true };
     const zig = try zigBin(alloc);
     const result = try runCapture(alloc, io, &.{ zig, "test", path }, null);

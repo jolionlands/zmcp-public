@@ -123,9 +123,9 @@ const read_exceptions = [_]ReadException{
 };
 
 const destructive_prefixes = [_][]const u8{
-    "delete-",      "terminate-",    "remove-",     "deregister-",  "detach-",   "revoke-",
-    "disable-",     "stop-",         "reboot-",     "purge-",       "cancel-",   "disassociate-",
-    "release-",     "reset-",        "deactivate-", "execute-",     "empty-",    "schedule-key-deletion",
+    "delete-",      "terminate-",    "remove-",     "deregister-", "detach-", "revoke-",
+    "disable-",     "stop-",         "reboot-",     "purge-",      "cancel-", "disassociate-",
+    "release-",     "reset-",        "deactivate-", "execute-",    "empty-",  "schedule-key-deletion",
     "send-command", "start-session", "invoke",
 };
 
@@ -213,9 +213,9 @@ pub fn gate(alloc: std.mem.Allocator, cfg: *const Config, class: Class, confirm:
 /// Flags callers may never set (also matched by any prefix, because the CLI
 /// argument parser accepts unambiguous abbreviations such as `--endpoint`).
 const denied_flags = [_][]const u8{
-    "endpoint-url",    "profile",      "no-verify-ssl", "ca-bundle",    "debug",          "v2-debug",
-    "output",          "query",        "no-paginate",   "max-items",    "no-sign-request", "color",
-    "version",         "help",         "region",        "no-cli-pager", "generate-cli-skeleton",
+    "endpoint-url", "profile", "no-verify-ssl", "ca-bundle",    "debug",                 "v2-debug",
+    "output",       "query",   "no-paginate",   "max-items",    "no-sign-request",       "color",
+    "version",      "help",    "region",        "no-cli-pager", "generate-cli-skeleton",
 };
 
 /// (service, op glob, flag): secret-returning flags. Denied when a key is an
@@ -227,6 +227,27 @@ const sensitive_flags = [_]SensitiveFlag{
     .{ .svc = "apigateway", .op = "get-api-key*", .flag = "include-values" },
     .{ .svc = "logs", .op = "tail", .flag = "follow" },
 };
+
+/// Flags whose VALUE is a secret being written. Params become argv entries,
+/// which any local user can read via /proc/<pid>/cmdline, and `file://` values
+/// are (deliberately) rejected, so these are refused rather than passed.
+const secret_input_flags = [_][]const u8{
+    "secret-string",        "secret-binary",     "plaintext",      "password",     "private-key",
+    "secret-access-key",    "client-secret",     "shared-secret",  "auth-token",   "secret-key",
+    "master-user-password", "master-password",   "admin-password", "new-password", "old-password",
+    "previous-password",    "proposed-password", "user-password",
+};
+
+/// True when `name` (kebab-case) is a secret-input flag for this call. Booleans
+/// are never secrets; `*-length` is metadata (get-random-password).
+pub fn isSecretInputFlag(service: []const u8, op: []const u8, name: []const u8, val: std.json.Value) bool {
+    if (val == .bool or val == .null) return false;
+    for (secret_input_flags) |f| if (isAbbrev(name, f)) return true;
+    if (std.mem.indexOf(u8, name, "password") != null and !std.mem.endsWith(u8, name, "-length")) return true;
+    // ssm put-parameter --value carries the (possibly SecureString) parameter.
+    if (std.mem.eql(u8, service, "ssm") and std.mem.eql(u8, op, "put-parameter") and isAbbrev(name, "value")) return true;
+    return false;
+}
 
 pub fn isAbbrev(key: []const u8, full: []const u8) bool {
     return key.len >= 1 and key.len <= full.len and std.mem.startsWith(u8, full, key);
@@ -509,6 +530,7 @@ pub fn build(alloc: std.mem.Allocator, cfg: *const Config, req: Request) !Built 
                     if (isAbbrev(name, d)) return err(alloc, "blocked: param '{s}' (--{s}) is not allowed; the server controls it", .{ raw, d });
                 }
                 if (std.mem.startsWith(u8, name, "cli-")) return err(alloc, "blocked: --{s} (cli-* options) are not allowed", .{name});
+                if (isSecretInputFlag(service, op, name, val)) return err(alloc, "blocked: param '{s}' (--{s}) would place a secret value on the aws command line, where other local users can read it (process listing). Secret-carrying inputs are refused; set the secret outside this tool (console, or a shell with file://).", .{ raw, name });
                 if (get_obj and isAbbrev(name, "range")) return err(alloc, "param 'range' is managed by the server for downloads", .{});
                 for (sensitive_flags) |sf| {
                     if (!(std.mem.eql(u8, sf.svc, service) and globMatch(sf.op, op))) continue;

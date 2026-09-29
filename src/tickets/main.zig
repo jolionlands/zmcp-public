@@ -390,8 +390,8 @@ pub fn ticketClose(
 
     const out_text = try std.fmt.allocPrint(
         alloc,
-        "{{\"id\":\"{s}\",\"status\":\"closed\"}}",
-        .{id},
+        "{{\"id\":{f},\"status\":\"closed\"}}",
+        .{std.json.fmt(id, .{})},
     );
     return .{ .text = out_text };
 }
@@ -431,7 +431,7 @@ pub fn ticketUpdate(
     try js.endObject();
     try appendLine(io, paths.tickets, sw.written());
 
-    const out_text = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"updated\":true}}", .{id});
+    const out_text = try std.fmt.allocPrint(alloc, "{{\"id\":{f},\"updated\":true}}", .{std.json.fmt(id, .{})});
     return .{ .text = out_text };
 }
 
@@ -531,7 +531,7 @@ pub fn sprintCancel(
     try js.endObject();
     try appendLine(io, paths.sprints, sw.written());
 
-    return .{ .text = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"status\":\"cancelled\"}}", .{id}) };
+    return .{ .text = try std.fmt.allocPrint(alloc, "{{\"id\":{f},\"status\":\"cancelled\"}}", .{std.json.fmt(id, .{})}) };
 }
 
 pub fn sprintStatus(
@@ -547,7 +547,7 @@ pub fn sprintStatus(
     var sprints = try loadSprints(arena, io, paths);
     const s = sprints.get(id) orelse {
         return .{
-            .text = try std.fmt.allocPrint(alloc, "{{\"error\":\"sprint not found\",\"id\":\"{s}\"}}", .{id}),
+            .text = try std.fmt.allocPrint(alloc, "{{\"error\":\"sprint not found\",\"id\":{f}}}", .{std.json.fmt(id, .{})}),
             .is_error = true,
         };
     };
@@ -606,8 +606,8 @@ pub fn swarmRun(
     // `pid swarm` thin client then calls the in-process swarm_tool.)
     const out_text = try std.fmt.allocPrint(
         alloc,
-        "{{\"swarm_id\":\"{s}\",\"prompt\":{},\"n\":{d},\"profile\":\"{s}\",\"strategy\":\"{s}\",\"ts_ms\":{d}}}",
-        .{ id[0..], std.json.fmt(prompt, .{}), n, profile, strategy, ts },
+        "{{\"swarm_id\":\"{s}\",\"prompt\":{f},\"n\":{d},\"profile\":{f},\"strategy\":{f},\"ts_ms\":{d}}}",
+        .{ id[0..], std.json.fmt(prompt, .{}), n, std.json.fmt(profile, .{}), std.json.fmt(strategy, .{}), ts },
     );
     return .{ .text = out_text };
 }
@@ -617,6 +617,12 @@ pub fn swarmRun(
 // Recipe lookup order: explicit arg → PID_VERIFY_CMD env → "echo ok".
 // Output is captured (up to 64 KB) and returned in the tool result.
 // ---------------------------------------------------------------------------
+
+fn execAllowed(alloc: std.mem.Allocator) bool {
+    const v = getEnv(alloc, "ZMCP_TICKETS_ALLOW_EXEC") orelse return false;
+    defer alloc.free(v);
+    return std.mem.eql(u8, v, "1");
+}
 
 pub fn verifyRun(
     alloc: std.mem.Allocator,
@@ -640,7 +646,7 @@ pub fn verifyRun(
         .stderr_limit = .limited(64 * 1024),
     }) catch |err| {
         return .{
-            .text = try std.fmt.allocPrint(alloc, "{{\"cmd\":\"{s}\",\"error\":\"{s}\"}}", .{ cmd, @errorName(err) }),
+            .text = try std.fmt.allocPrint(alloc, "{{\"cmd\":{f},\"error\":{f}}}", .{ std.json.fmt(cmd, .{}), std.json.fmt(@errorName(err), .{}) }),
             .is_error = true,
         };
     };
@@ -779,6 +785,10 @@ fn handleSwarmRun(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value
 fn handleVerifyRun(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !mcp.ToolResult {
     _ = io;
     const recipe = argString(args, "recipe");
+    if (!execAllowed(allocator)) return .{
+        .text = "verify_run runs a shell command and is disabled by default; set ZMCP_TICKETS_ALLOW_EXEC=1 to enable it",
+        .is_error = true,
+    };
     return verifyRun(allocator, g_io, recipe);
 }
 
@@ -1079,6 +1089,40 @@ test "swarm_run appends to swarm.jsonl" {
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, paths.swarm, alloc, .unlimited);
     defer alloc.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "find foo") != null);
+}
+
+test "ids/profile containing quotes cannot inject JSON keys" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPath(io, &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+    var paths = try pathsForTmp(alloc, tmp_path);
+    defer paths.deinit(alloc);
+
+    const evil = "x\",\"injected\":\"pwned";
+
+    const c = try sprintCancel(alloc, io, paths, evil);
+    defer alloc.free(c.text);
+    const nf = try sprintStatus(alloc, io, paths, evil);
+    defer alloc.free(nf.text);
+    const cl = try ticketClose(alloc, io, paths, evil, "done");
+    defer alloc.free(cl.text);
+    const up = try ticketUpdate(alloc, io, paths, evil, null, null, null, null);
+    defer alloc.free(up.text);
+    const sw = try swarmRun(alloc, io, paths, "p", 1, evil, evil);
+    defer alloc.free(sw.text);
+
+    for ([_][]const u8{ c.text, nf.text, cl.text, up.text, sw.text }) |txt| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, txt, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        try std.testing.expect(parsed.value.object.get("injected") == null);
+        if (parsed.value.object.get("id")) |v| try std.testing.expectEqualStrings(evil, v.string);
+    }
 }
 
 test "env lookup reads the real process environment (not an empty block)" {

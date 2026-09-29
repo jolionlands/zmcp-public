@@ -3,7 +3,7 @@
 //! the gateway enforces on its own tool view.
 //!
 //! Config file: {"profiles": {"dev": {"servers": ["memory","git"],
-//!   "tools_allow": ["git_*"], "tools_deny": ["git_reset"], "readonly": false}}}
+//!   "tools_allow": ["git_*"], "tools_deny": ["git_reset"], "readonly": false, "no_destructive": false}}}
 //! Globs are exact names or a trailing `*` (same as ZMCP_TOOLS in mcp.zig).
 
 const std = @import("std");
@@ -28,9 +28,11 @@ pub const Slice = struct {
     allow: []const []const u8 = &.{},
     deny: []const []const u8 = &.{},
     readonly: bool = false,
+    /// Hide and refuse tools marked destructive (annotations.destructiveHint).
+    no_destructive: bool = false,
 
     pub fn isEmpty(self: Slice) bool {
-        return self.allow.len == 0 and self.deny.len == 0 and !self.readonly;
+        return self.allow.len == 0 and self.deny.len == 0 and !self.readonly and !self.no_destructive;
     }
 };
 
@@ -45,12 +47,14 @@ pub const Reason = enum {
     allow,
     deny,
     readonly,
+    no_destructive,
 
     pub fn message(self: Reason) []const u8 {
         return switch (self) {
             .allow => "not in the profile's tools_allow",
             .deny => "denied by the profile's tools_deny",
             .readonly => "not marked read-only (readonly profile)",
+            .no_destructive => "marked destructive (no_destructive profile)",
         };
     }
 };
@@ -64,9 +68,15 @@ fn matchesAny(patterns: []const []const u8, name: []const u8) bool {
 /// allow; an allowlist hides everything it does not name; readonly hides
 /// tools without annotations.readOnlyHint.
 pub fn hiddenBy(sl: Slice, tool_name: []const u8, read_only: bool) ?Reason {
+    return hiddenByTool(sl, tool_name, read_only, false);
+}
+
+/// `hiddenBy` plus no_destructive: tools with destructiveHint are hidden.
+pub fn hiddenByTool(sl: Slice, tool_name: []const u8, read_only: bool, destructive: bool) ?Reason {
     if (matchesAny(sl.deny, tool_name)) return .deny;
     if (sl.allow.len > 0 and !matchesAny(sl.allow, tool_name)) return .allow;
     if (sl.readonly and !read_only) return .readonly;
+    if (sl.no_destructive and destructive) return .no_destructive;
     return null;
 }
 
@@ -179,6 +189,14 @@ pub fn parseConfig(gpa: std.mem.Allocator, text: []const u8, diag: *Diag) ParseE
             }
             ro = r.bool;
         }
+        var nd = false;
+        if (pv.object.get("no_destructive")) |r| {
+            if (r != .bool) {
+                diag.set("profile '{s}': no_destructive must be true or false", .{pname});
+                return error.InvalidConfig;
+            }
+            nd = r.bool;
+        }
         try list.append(a, .{
             .name = pname,
             .servers = servers,
@@ -186,6 +204,7 @@ pub fn parseConfig(gpa: std.mem.Allocator, text: []const u8, diag: *Diag) ParseE
                 .allow = try stringList(a, pv.object.get("tools_allow"), "tools_allow", pname, diag),
                 .deny = try stringList(a, pv.object.get("tools_deny"), "tools_deny", pname, diag),
                 .readonly = ro,
+                .no_destructive = nd,
             },
         });
     }
@@ -340,6 +359,27 @@ test "parseConfig rejects bad shapes with a message" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "no_destructive: profile key parses, hides destructive tools, deny still wins" {
+    const alloc = std.testing.allocator;
+    var d: Diag = .{};
+    var cfg = try parseConfig(alloc, "{\"profiles\":{\"safe\":{\"servers\":[\"git\"],\"no_destructive\":true},\"open\":{}}}", &d);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.find("safe").?.slice.no_destructive);
+    try std.testing.expect(!cfg.find("open").?.slice.no_destructive);
+    try std.testing.expect(!(Slice{ .no_destructive = true }).isEmpty());
+    const sl: Slice = .{ .no_destructive = true };
+    try std.testing.expectEqual(Reason.no_destructive, hiddenByTool(sl, "git_reset", false, true).?);
+    try std.testing.expect(hiddenByTool(sl, "git_status", true, false) == null);
+    try std.testing.expect(hiddenByTool(sl, "git_commit", false, false) == null);
+    // Off by default; and the old entry point never reports it.
+    try std.testing.expect(hiddenByTool(.{}, "git_reset", false, true) == null);
+    try std.testing.expect(hiddenBy(sl, "git_reset", false) == null);
+    try std.testing.expectEqual(Reason.deny, hiddenByTool(.{ .no_destructive = true, .deny = &.{"git_reset"} }, "git_reset", false, true).?);
+    var d2: Diag = .{};
+    try std.testing.expectError(error.InvalidConfig, parseConfig(alloc, "{\"profiles\":{\"a\":{\"no_destructive\":\"yes\"}}}", &d2));
+    try std.testing.expect(std.mem.indexOf(u8, d2.text(), "no_destructive must be") != null);
 }
 
 test "hiddenBy: glob allow/deny and readonly, deny wins" {

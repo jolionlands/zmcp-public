@@ -74,7 +74,7 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "docker_inspect",
-        .description = "Low-level JSON details of a container, image, network or volume (docker inspect). Output is byte-capped. Read-only.",
+        .description = "Low-level JSON details of a container, image, network or volume (docker inspect). Environment variables whose NAME looks secret-like (password, secret, token, key, credential, passwd, auth, dsn) are shown as NAME=[redacted], and user:pass@ credentials in URLs are masked; this is a name-based heuristic, so other secrets in labels/commands may still appear. Output is byte-capped. Read-only.",
         .input_schema_json =
         \\{"type":"object","properties":{"target":{"type":"string","description":"Container/image/etc. name or id"}},"required":["target"]}
         ,
@@ -174,6 +174,78 @@ fn refErrorText(alloc: std.mem.Allocator, name: []const u8, err: RefError) ![]co
     return std.fmt.allocPrint(alloc, "error: invalid {s}: {s}", .{ name, why });
 }
 
+// ---------------------------------------------------------------------------
+// docker inspect redaction (pure)
+// ---------------------------------------------------------------------------
+
+const secret_name_parts = [_][]const u8{ "password", "secret", "token", "key", "credential", "passwd", "auth", "dsn" };
+
+/// True when an environment variable NAME looks secret-like (case-insensitive).
+pub fn envNameLooksSecret(name: []const u8) bool {
+    for (secret_name_parts) |p| if (std.ascii.indexOfIgnoreCase(name, p) != null) return true;
+    return false;
+}
+
+/// Replace `user:pass@` (any userinfo) in every `scheme://userinfo@host` found
+/// in `s`. Returns `s` itself when nothing matched.
+pub fn redactUrlUserinfo(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var cur: []const u8 = s;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, cur, from, "://")) |i| {
+        const astart = i + 3;
+        var aend = astart;
+        while (aend < cur.len and switch (cur[aend]) {
+            '/', '?', '#', ' ', '\t', '\n', '\r', '"', '\'' => false,
+            else => true,
+        }) aend += 1;
+        from = astart;
+        const at = std.mem.lastIndexOfScalar(u8, cur[astart..aend], '@') orelse continue;
+        if (std.mem.eql(u8, cur[astart .. astart + at], "[redacted]")) continue;
+        cur = try std.mem.concat(alloc, u8, &.{ cur[0..astart], "[redacted]", cur[astart + at ..] });
+        from = astart + "[redacted]".len;
+    }
+    return cur;
+}
+
+fn redactEnvEntry(alloc: std.mem.Allocator, entry: []const u8) ![]const u8 {
+    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return entry;
+    const name = entry[0..eq];
+    if (envNameLooksSecret(name)) return std.fmt.allocPrint(alloc, "{s}=[redacted]", .{name});
+    const v = try redactUrlUserinfo(alloc, entry[eq + 1 ..]);
+    if (v.ptr == entry[eq + 1 ..].ptr) return entry;
+    return std.fmt.allocPrint(alloc, "{s}={s}", .{ name, v });
+}
+
+fn redactInspectValue(alloc: std.mem.Allocator, v: *std.json.Value, depth: usize) !void {
+    if (depth > 64) return error.TooDeep;
+    switch (v.*) {
+        .string => |s| v.* = .{ .string = try redactUrlUserinfo(alloc, s) },
+        .array => |*arr| for (arr.items) |*x| try redactInspectValue(alloc, x, depth + 1),
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                // Config.Env (containers, images) and service/task Env lists.
+                if (std.mem.eql(u8, e.key_ptr.*, "Env") and e.value_ptr.* == .array) {
+                    for (e.value_ptr.array.items) |*x| {
+                        if (x.* == .string) x.* = .{ .string = try redactEnvEntry(alloc, x.string) } else try redactInspectValue(alloc, x, depth + 1);
+                    }
+                    continue;
+                }
+                try redactInspectValue(alloc, e.value_ptr, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+/// Parse `docker inspect` JSON, redact secret-like env vars and URL userinfo,
+/// and re-serialise. Errors (never raw output) if the input is not valid JSON.
+pub fn redactInspect(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+    try redactInspectValue(alloc, &root, 0);
+    return std.json.Stringify.valueAlloc(alloc, root, .{ .whitespace = .indent_4 });
+}
+
 fn clampTail(raw: ?i64) u32 {
     const v = raw orelse return DEFAULT_TAIL;
     if (v < 0) return DEFAULT_TAIL;
@@ -224,7 +296,7 @@ fn capOutput(alloc: std.mem.Allocator, data: []const u8, max: usize, keep_tail: 
     return std.fmt.allocPrint(alloc, "{s}\n[output truncated: showing first {d} of {d} bytes]", .{ data[0..max], max, data.len });
 }
 
-const Mode = struct { keep_tail: bool = false, merge_stderr: bool = false };
+const Mode = struct { keep_tail: bool = false, merge_stderr: bool = false, redact_inspect: bool = false };
 
 /// Run argv through the exec seam and shape the result into a ToolResult.
 fn run(alloc: std.mem.Allocator, io: Io, argv: []const []const u8, mode: Mode) !mcp.ToolResult {
@@ -242,6 +314,14 @@ fn run(alloc: std.mem.Allocator, io: Io, argv: []const []const u8, mode: Mode) !
         else => return errResult("error: docker terminated abnormally"),
     }
     var body: []const u8 = res.stdout;
+    if (mode.redact_inspect) {
+        // Never fall back to raw output: it may carry Config.Env secrets.
+        if (res.truncated) return errResult("error: docker inspect output too large to redact safely; refusing to return it");
+        body = redactInspect(alloc, res.stdout) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return errResult("error: docker inspect output was not valid JSON; refusing to return it unredacted"),
+        };
+    }
     if (mode.merge_stderr and stderr_trim.len > 0) {
         // `docker logs` relays the container's stderr on our stderr.
         body = try std.mem.concat(alloc, u8, &.{ res.stdout, res.stderr });
@@ -400,7 +480,7 @@ fn handleLogs(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolR
 }
 
 fn handleInspect(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
-    return runBuilt(alloc, io, try buildInspect(alloc, args), .{});
+    return runBuilt(alloc, io, try buildInspect(alloc, args), .{ .redact_inspect = true });
 }
 
 fn handleStats(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
@@ -694,4 +774,49 @@ test "tool table: names unique and schemas valid JSON" {
         p.deinit();
     }
     try std.testing.expectEqual(@as(usize, 10), tool_table.len);
+}
+
+test "redactInspect: secret-like env names and URL userinfo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw =
+        \\[{"Id":"abc","Config":{"Env":["PATH=/usr/bin","DB_PASSWORD=hunter2","api_key=k1","AWS_SECRET_ACCESS_KEY=zzz","GITHUB_TOKEN=t","DATABASE_DSN=x","AUTH_HEADER=b","MY_CREDENTIALS=c","PGPASSWD=p","REDIS_URL=redis://user:pw@cache:6379/0","PLAIN=hello","NOEQUALS"],
+        \\"Labels":{"url":"https://bob:s3cr3t@git.example.com/repo.git"}},"State":{"Status":"running"}}]
+    ;
+    const out = try redactInspect(a, raw);
+    for ([_][]const u8{ "hunter2", "\"k1", "zzz", "\"t\"", "GITHUB_TOKEN=t", "user:pw", "s3cr3t", "bob:" }) |bad|
+        try std.testing.expect(std.mem.indexOf(u8, out, bad) == null);
+    for ([_][]const u8{ "DB_PASSWORD=[redacted]", "api_key=[redacted]", "AWS_SECRET_ACCESS_KEY=[redacted]", "GITHUB_TOKEN=[redacted]", "DATABASE_DSN=[redacted]", "AUTH_HEADER=[redacted]", "MY_CREDENTIALS=[redacted]", "PGPASSWD=[redacted]", "PATH=/usr/bin", "PLAIN=hello", "NOEQUALS", "[redacted]@cache:6379/0", "[redacted]@git.example.com/repo.git", "\"Status\": \"running\"" }) |good|
+        try std.testing.expect(std.mem.indexOf(u8, out, good) != null);
+}
+
+test "redactUrlUserinfo leaves clean strings alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = "https://example.com/a@b";
+    try std.testing.expectEqual(c.ptr, (try redactUrlUserinfo(a, c)).ptr);
+    try std.testing.expectEqualStrings("s://[redacted]@h:1/p y", try redactUrlUserinfo(a, "s://u:p@h:1/p y"));
+}
+
+test "handleInspect redacts env, and errors on non-JSON instead of returning raw" {
+    var ctx: TestCtx = undefined;
+    ctx.init();
+    defer ctx.deinit();
+    fake_result = .{ .term = .{ .exited = 0 }, .stdout = @constCast("[{\"Config\":{\"Env\":[\"SECRET_X=abc\",\"A=b\"]}}]"), .stderr = @constCast("") };
+    const r = try handleInspect(ctx.arena, std.testing.io, try ctx.args("{\"target\":\"web\"}"));
+    try std.testing.expect(!r.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "abc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "SECRET_X=[redacted]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "A=b") != null);
+
+    fake_result = .{ .term = .{ .exited = 0 }, .stdout = @constCast("Env: SECRET_X=abc not json"), .stderr = @constCast("") };
+    const e = try handleInspect(ctx.arena, std.testing.io, try ctx.args("{\"target\":\"web\"}"));
+    try std.testing.expect(e.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "abc") == null);
+
+    fake_result = .{ .term = .{ .exited = 0 }, .stdout = @constCast("[{\"Config\":{\"Env\":[\"SECRET_X=abc"), .stderr = @constCast(""), .truncated = true };
+    const t = try handleInspect(ctx.arena, std.testing.io, try ctx.args("{\"target\":\"web\"}"));
+    try std.testing.expect(t.is_error);
 }

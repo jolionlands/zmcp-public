@@ -185,8 +185,8 @@ test "a call that outlives the timeout kills the child and the next call recover
     try std.testing.expectEqualStrings("echo:again", ok.text);
 }
 
-test "children inherit the environment minus gateway-only variables, plus their slice envs" {
-    const env = try Env.init(&.{});
+test "children get a scoped environment: no foreign credentials, own ZMCP_<NAME>_ vars, slice envs" {
+    const env = try Env.init(&.{ .{ "ZMCP_FAKE_FLAG", "on" }, .{ "ZMCP_AWS_ALLOW_DESTRUCTIVE", "1" }, .{ "ZMCP_MAX_RESULT_BYTES", "5000" } });
     defer env.deinit();
     _ = boot.refresh(std.testing.io, &env.cat, env.real.locator, &env.real, &.{"fake"}, true, 10_000);
     try env.real.plans.put(alloc, "fake", .{ .deny = "fake_crash", .readonly = true });
@@ -197,7 +197,10 @@ test "children inherit the environment minus gateway-only variables, plus their 
     const a = arena.allocator();
 
     const want = [_]struct { name: []const u8, value: []const u8 }{
-        .{ .name = "MY_API_KEY", .value = "k123" }, // inherited
+        .{ .name = "MY_API_KEY", .value = "<unset>" }, // not this child's credential
+        .{ .name = "ZMCP_AWS_ALLOW_DESTRUCTIVE", .value = "<unset>" }, // another server's write flag
+        .{ .name = "ZMCP_FAKE_FLAG", .value = "on" }, // ZMCP_<CHILD>_*
+        .{ .name = "ZMCP_MAX_RESULT_BYTES", .value = "5000" }, // base allowlist
         .{ .name = "ZMCP_HTTP_TOKEN", .value = "<unset>" },
         .{ .name = "ZMCP_HTTP", .value = "<unset>" },
         .{ .name = "ZMCP_GATEWAY_PROFILE", .value = "<unset>" },
@@ -216,6 +219,30 @@ test "children inherit the environment minus gateway-only variables, plus their 
     try std.testing.expect(blocked.is_error and contains(blocked.text, "not marked read-only"));
     const denied = try callJson(gw, a, "fake_crash", "{}");
     try std.testing.expect(denied.is_error and contains(denied.text, "disabled"));
+}
+
+test "ZMCP_GATEWAY_PASS_ENV and ZMCP_GATEWAY_INHERIT_ENV widen the child environment" {
+    const env = try Env.init(&.{.{ "ZMCP_GATEWAY_PASS_ENV", "MY_API_KEY" }});
+    defer env.deinit();
+    _ = boot.refresh(std.testing.io, &env.cat, env.real.locator, &env.real, &.{"fake"}, true, 10_000);
+    const gw = try gateway.Gateway.init(alloc, &env.cat, &.{"fake"}, .{}, "", env.real.spawner(), .{}, .{ .idle_ms = 0 });
+    defer gw.deinit(std.testing.io);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const r = try callJson(gw, arena.allocator(), "fake_env", "{\"name\":\"MY_API_KEY\"}");
+    try std.testing.expectEqualStrings("k123", r.text);
+    const g = try callJson(gw, arena.allocator(), "fake_env", "{\"name\":\"ZMCP_GATEWAY_PASS_ENV\"}");
+    try std.testing.expectEqualStrings("<unset>", g.text);
+
+    const env2 = try Env.init(&.{.{ "ZMCP_GATEWAY_INHERIT_ENV", "1" }});
+    defer env2.deinit();
+    _ = boot.refresh(std.testing.io, &env2.cat, env2.real.locator, &env2.real, &.{"fake"}, true, 10_000);
+    const gw2 = try gateway.Gateway.init(alloc, &env2.cat, &.{"fake"}, .{}, "", env2.real.spawner(), .{}, .{ .idle_ms = 0 });
+    defer gw2.deinit(std.testing.io);
+    const r2 = try callJson(gw2, arena.allocator(), "fake_env", "{\"name\":\"MY_API_KEY\"}");
+    try std.testing.expectEqualStrings("k123", r2.text);
+    const t2 = try callJson(gw2, arena.allocator(), "fake_env", "{\"name\":\"ZMCP_HTTP_TOKEN\"}");
+    try std.testing.expectEqualStrings("<unset>", t2.text);
 }
 
 test "a missing server binary is reported without crashing the gateway" {

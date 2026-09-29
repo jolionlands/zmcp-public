@@ -9,10 +9,10 @@ pub const MAX_OUTPUT: usize = 64 * 1024;
 /// Key names (normalised: lowercase, no `_ - . space`) whose string values are
 /// always redacted (substring match).
 const secret_key_parts = [_][]const u8{
-    "secretaccesskey", "secretstring",  "secretbinary",       "sessiontoken",  "securitytoken",
-    "accesskeyid",     "privatekey",    "keymaterial",        "clientsecret",  "secretkey",
-    "apikey",          "authorizationtoken", "accesstoken",   "idtoken",       "refreshtoken",
-    "authtoken",       "bearertoken",   "userdata",           "sharedsecret",  "passwd",
+    "secretaccesskey", "secretstring",       "secretbinary", "sessiontoken", "securitytoken",
+    "accesskeyid",     "privatekey",         "keymaterial",  "clientsecret", "secretkey",
+    "apikey",          "authorizationtoken", "accesstoken",  "idtoken",      "refreshtoken",
+    "authtoken",       "bearertoken",        "userdata",     "sharedsecret", "passwd",
 };
 /// Exact normalised key names that are redacted.
 const secret_key_exact = [_][]const u8{ "secret", "token", "pwd", "signature" };
@@ -68,21 +68,61 @@ fn eqAny(list: []const []const u8, k: []const u8) bool {
     return false;
 }
 
-/// Replace values of secret-looking query parameters and PEM private keys in a
-/// free-form string. Returns the input unchanged (same pointer) when clean.
+fn isValueEnd(c: u8) bool {
+    return switch (c) {
+        '&', '"', ' ', '\'', '\n', '\r', '\t', ';', ',', '<', '>', ')' => true,
+        else => false,
+    };
+}
+
+const scrub_needles = [_][]const u8{
+    "X-Amz-Signature=", "X-Amz-Security-Token=", "Signature=", "AWSAccessKeyId=", "X-Amz-Credential=",
+    "access_token=",    "api_key=",              "apikey=",    "token=",          "password=",
+    "passwd=",          "secret=",               "sig=",       "Bearer ",         "Authorization: Basic ",
+};
+
+fn hasPrivateKeyMarker(s: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(s, "PRIVATE KEY-----") != null or
+        std.ascii.indexOfIgnoreCase(s, "PRIVATE KEY BLOCK-----") != null;
+}
+
+/// Replace the password in `user:pass@host` userinfo (with or without a scheme).
+fn scrubUserinfo(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var cur = s;
+    var from: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, cur, from, '@')) |at| {
+        from = at + 1;
+        var ts = at;
+        while (ts > 0) : (ts -= 1) {
+            const c = cur[ts - 1];
+            if (c == '/' or c == '"' or c == '\'' or c == '<' or c == '>' or c == '=' or c == ',' or c == ' ' or c == '\n' or c == '\r' or c == '\t' or c == '(') break;
+        }
+        const tok = cur[ts..at];
+        const colon = std.mem.indexOfScalar(u8, tok, ':') orelse continue;
+        const pstart = ts + colon + 1;
+        if (pstart >= at) continue; // empty password
+        if (at + 1 >= cur.len or isValueEnd(cur[at + 1])) continue; // no host
+        if (std.mem.eql(u8, cur[pstart..at], REDACTED)) continue;
+        cur = try std.mem.concat(alloc, u8, &.{ cur[0..pstart], REDACTED, cur[at..] });
+        from = pstart + REDACTED.len + 1;
+    }
+    return cur;
+}
+
+/// Replace values of secret-looking query parameters / key=value pairs, bearer
+/// tokens, URL userinfo passwords and PEM private keys in a free-form string.
+/// Returns the input unchanged (same pointer) when clean.
 pub fn scrubString(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (s.len < 12) return s;
-    if (std.mem.indexOf(u8, s, "PRIVATE KEY-----") != null) return REDACTED;
-    if (std.mem.indexOfScalar(u8, s, '=') == null) return s;
-    const needles = [_][]const u8{ "X-Amz-Signature=", "X-Amz-Security-Token=", "Signature=", "AWSAccessKeyId=", "X-Amz-Credential=" };
+    if (s.len < 8) return s;
+    if (hasPrivateKeyMarker(s)) return REDACTED;
     var cur: []const u8 = s;
-    for (needles) |n| {
+    for (scrub_needles) |n| {
         var from: usize = 0;
         while (std.ascii.indexOfIgnoreCasePos(cur, from, n)) |i| {
             const vstart = i + n.len;
             var vend = vstart;
-            while (vend < cur.len and cur[vend] != '&' and cur[vend] != '"' and cur[vend] != ' ' and cur[vend] != '\'' and cur[vend] != '\n') vend += 1;
-            if (std.mem.eql(u8, cur[vstart..vend], REDACTED)) {
+            while (vend < cur.len and !isValueEnd(cur[vend])) vend += 1;
+            if (vend == vstart or std.mem.eql(u8, cur[vstart..vend], REDACTED)) {
                 from = vend;
                 continue;
             }
@@ -90,7 +130,72 @@ pub fn scrubString(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
             from = vstart + REDACTED.len;
         }
     }
-    return cur;
+    return scrubUserinfo(alloc, cur);
+}
+
+fn isUpperAlnum(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
+}
+fn isB64(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '/' or c == '+' or c == '=';
+}
+
+fn labelBefore(text: []const u8, end: usize) bool {
+    const lo = end -| 40;
+    var line_start = lo;
+    if (std.mem.lastIndexOfScalar(u8, text[lo..end], '\n')) |nl| line_start = lo + nl + 1;
+    const win = text[line_start..end];
+    for ([_][]const u8{ "secret", "key", "token", "credential", "password" }) |l| {
+        if (std.ascii.indexOfIgnoreCase(win, l) != null) return true;
+    }
+    return false;
+}
+
+/// Scrub free-form (non-JSON) CLI text: everything `scrubString` does, plus
+/// AKIA/ASIA access key ids and 40-char base64-ish secret access keys that sit
+/// next to a key-name-like label. Heuristic, best effort.
+pub fn scrubText(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const base = try scrubString(alloc, s);
+    if (std.mem.eql(u8, base, REDACTED)) return base;
+    var out: std.ArrayList(u8) = .empty;
+    var changed = false;
+    var i: usize = 0;
+    while (i < base.len) {
+        // AKIA/ASIA + 16 [0-9A-Z]
+        if (i + 20 <= base.len and (std.mem.startsWith(u8, base[i..], "AKIA") or std.mem.startsWith(u8, base[i..], "ASIA")) and
+            (i == 0 or !std.ascii.isAlphanumeric(base[i - 1])))
+        {
+            var ok = true;
+            for (base[i + 4 .. i + 20]) |c| if (!isUpperAlnum(c)) {
+                ok = false;
+                break;
+            };
+            if (ok and (i + 20 == base.len or !std.ascii.isAlphanumeric(base[i + 20]))) {
+                try out.appendSlice(alloc, REDACTED);
+                changed = true;
+                i += 20;
+                continue;
+            }
+        }
+        // exactly-40-char base64-ish run after a key-ish label
+        if (isB64(base[i]) and (i == 0 or !isB64(base[i - 1]))) {
+            var e = i;
+            while (e < base.len and isB64(base[e])) e += 1;
+            if (e - i == 40 and labelBefore(base, i)) {
+                try out.appendSlice(alloc, REDACTED);
+                changed = true;
+                i = e;
+                continue;
+            }
+            try out.appendSlice(alloc, base[i..e]);
+            i = e;
+            continue;
+        }
+        try out.append(alloc, base[i]);
+        i += 1;
+    }
+    if (!changed) return base;
+    return out.items;
 }
 
 fn redactStrings(v: *std.json.Value, depth: usize) usize {
@@ -218,7 +323,7 @@ fn capText(alloc: std.mem.Allocator, s: []const u8, cap: usize) !struct { []cons
 pub fn compactOutput(alloc: std.mem.Allocator, raw: []const u8, cap: usize) !Compacted {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     var parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, trimmed, .{}) catch {
-        const scrubbed = try scrubString(alloc, trimmed);
+        const scrubbed = try scrubText(alloc, trimmed);
         const c = try capText(alloc, scrubbed, cap);
         return .{ .text = c[0], .hard_cut = c[1] };
     };
@@ -315,6 +420,64 @@ test "scrubString handles presigned URLs and leaves clean strings alone" {
     const u = try scrubString(a, "https://h/p?a=1&x-amz-signature=DEADBEEF&X-Amz-Security-Token=TOK123&b=2");
     try testing.expectEqualStrings("https://h/p?a=1&x-amz-signature=[REDACTED]&X-Amz-Security-Token=[REDACTED]&b=2", u);
     try testing.expectEqualStrings(REDACTED, try scrubString(a, "-----BEGIN PRIVATE KEY-----\nabc"));
+}
+
+test "scrubString works without '=' : userinfo and bearer" {
+    var arena = arenaTest();
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("postgres://admin:[REDACTED]@host/db", try scrubString(a, "postgres://admin:pw@host/db"));
+    try testing.expectEqualStrings("admin:[REDACTED]@host:5432", try scrubString(a, "admin:secretpw@host:5432"));
+    try testing.expectEqualStrings("Authorization: Bearer [REDACTED]", try scrubString(a, "Authorization: Bearer abc.def.ghi"));
+    try testing.expectEqualStrings("Authorization: Basic [REDACTED]", try scrubString(a, "Authorization: Basic dXNlcjpwdw=="));
+    // password containing '@'
+    const r = try scrubString(a, "mysql://u:p@ss@db.local/x");
+    try testing.expect(!contains(r, "p@ss") and !contains(r, ":ss") and contains(r, "db.local"));
+    // benign: no password, email-ish, timestamps
+    const c1 = "https://user@example.com/path/long";
+    try testing.expectEqual(c1.ptr, (try scrubString(a, c1)).ptr);
+    const c2 = "contact bob@example.com for details";
+    try testing.expectEqual(c2.ptr, (try scrubString(a, c2)).ptr);
+}
+
+test "scrubString new needles are case-insensitive" {
+    var arena = arenaTest();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][2][]const u8{
+        .{ "GET /x?access_token=abc123&z=1", "GET /x?access_token=[REDACTED]&z=1" },
+        .{ "curl ?API_KEY=k1 done", "curl ?API_KEY=[REDACTED] done" },
+        .{ "cfg apikey=k2;other=1", "cfg apikey=[REDACTED];other=1" },
+        .{ "a Token=zzz b", "a Token=[REDACTED] b" },
+        .{ "db Password=hunter2 x", "db Password=[REDACTED] x" },
+        .{ "db PASSWD=hunter2 x", "db PASSWD=[REDACTED] x" },
+        .{ "the Secret=s3 x", "the Secret=[REDACTED] x" },
+        .{ "https://h/p?sig=AbC&se=1", "https://h/p?sig=[REDACTED]&se=1" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c[1], try scrubString(a, c[0]));
+    // idempotent
+    const once = try scrubString(a, "x?token=abc&password=def zz");
+    try testing.expectEqualStrings(once, try scrubString(a, once));
+}
+
+test "scrubString PEM needle is case-insensitive and matches PGP blocks" {
+    var arena = arenaTest();
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(REDACTED, try scrubString(a, "-----begin rsa private key-----\nabc"));
+    try testing.expectEqualStrings(REDACTED, try scrubString(a, "-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc"));
+}
+
+test "compactOutput non-JSON fallback scrubs urls, key ids and secret keys" {
+    var arena = arenaTest();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try compactOutput(a, "endpoint postgres://admin:pw@host/db\nAccessKeyId     AKIAIOSFODNN7EXAMPLE\nTemp ASIAIOSFODNN7EXAMPLE ok\nSecretAccessKey wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n", MAX_OUTPUT);
+    for ([_][]const u8{ ":pw@", "AKIAIOSFODNN7", "ASIAIOSFODNN7", "wJalrXUtnFEMI" }) |bad| try testing.expect(!contains(c.text, bad));
+    try testing.expect(contains(c.text, "host/db") and contains(c.text, "ok"));
+    // 40-char run without a label is left alone; AKIA embedded in a longer word too
+    const t = try compactOutput(a, "sha1 da39a3ee5e6b4b0d3255bfef95601890afd80709 done\nXAKIAIOSFODNN7EXAMPLE", MAX_OUTPUT);
+    try testing.expect(contains(t.text, "da39a3ee5e6b4b0d3255bfef95601890afd80709") and contains(t.text, "XAKIA"));
 }
 
 test "compactOutput drops ResponseMetadata and redacts" {

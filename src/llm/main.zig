@@ -365,6 +365,14 @@ fn errorDetail(alloc: std.mem.Allocator, body: []const u8) []const u8 {
     return "";
 }
 
+/// Upstream error text sometimes echoes the API key ("Incorrect API key
+/// provided: sk-..."); never pass that on to the model or the log.
+fn redactKey(alloc: std.mem.Allocator, s: []const u8) []const u8 {
+    const key = env("OPENAI_API_KEY") orelse return s;
+    if (key.len < 4 or std.mem.indexOf(u8, s, key) == null) return s;
+    return std.mem.replaceOwned(u8, alloc, s, key, "[redacted]") catch "[redacted]";
+}
+
 fn clip(s: []const u8, n: usize) []const u8 {
     if (s.len <= n) return s;
     var c = n;
@@ -377,7 +385,7 @@ fn containsIgnoreCase(h: []const u8, n: []const u8) bool {
 }
 
 fn mapError(alloc: std.mem.Allocator, status: u16, body: []const u8) ![]const u8 {
-    const detail = errorDetail(alloc, body);
+    const detail = redactKey(alloc, errorDetail(alloc, body));
     const model_missing = containsIgnoreCase(detail, "model") and
         (containsIgnoreCase(detail, "not found") or containsIgnoreCase(detail, "does not exist") or
             containsIgnoreCase(detail, "not exist") or containsIgnoreCase(detail, "no such") or containsIgnoreCase(detail, "unknown"));
@@ -1117,6 +1125,7 @@ test "error mapping 401/404/429/500 and model-not-found hint" {
         const r = try handleChat(a, undefined, try parseArgs(a, "{\"prompt\":\"hi\"}"));
         try std.testing.expect(r.is_error);
         try std.testing.expect(std.mem.indexOf(u8, r.text, c.want) != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "sk-secret-123") == null);
     }
     // detail is clipped and the status is present
     Mock.status = 500;

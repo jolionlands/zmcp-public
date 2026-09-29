@@ -51,12 +51,12 @@ const tool_table = [_]mcp.ToolDef{
     .{
         .name = "md_render_file",
         .read_only = true,
-        .description = "Read a Markdown file from disk and render it to ANSI.",
+        .description = "Read a Markdown file from disk and render it to ANSI. Confined to ZMCP_MD_ROOT (default: the server's working directory).",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
-        \\    "path": { "type": "string", "description": "Absolute or cwd-relative path to a Markdown file." },
+        \\    "path": { "type": "string", "description": "Path to a Markdown file; must resolve inside ZMCP_MD_ROOT (default: the server's working directory)." },
         \\    "width": { "type": "integer", "description": "Target width in columns. Default 100." }
         \\  },
         \\  "required": ["path"]
@@ -73,7 +73,7 @@ const tool_table = [_]mcp.ToolDef{
         \\  "type": "object",
         \\  "properties": {
         \\    "markdown": { "type": "string", "description": "Markdown source. Mutually exclusive with path." },
-        \\    "path": { "type": "string", "description": "File to read instead of markdown." },
+        \\    "path": { "type": "string", "description": "File to read instead of markdown; must resolve inside ZMCP_MD_ROOT (default: the server's working directory)." },
         \\    "lang": { "type": "string", "description": "Optional language filter, e.g. 'zig' or 'js'." }
         \\  }
         \\}
@@ -98,8 +98,30 @@ fn getInt(args: std.json.Value, key: []const u8, default: i64) i64 {
     };
 }
 
+const max_file_bytes: usize = 8 * 1024 * 1024;
+
+/// Read `path` only if its canonical location lies inside `root` (canonical,
+/// default: cwd). Fails closed: any resolution failure or escape is an error.
+fn readTextFileIn(alloc: std.mem.Allocator, io: std.Io, root_arg: ?[]const u8, path: []const u8) ![]u8 {
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    var tmp = std.heap.ArenaAllocator.init(alloc);
+    defer tmp.deinit();
+    const a = tmp.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const root = cwd.realPathFileAlloc(io, root_arg orelse ".", a) catch return error.RootNotAccessible;
+    const joined = if (std.fs.path.isAbsolute(path)) path else try std.fs.path.join(a, &.{ root, path });
+    const real = try cwd.realPathFileAlloc(io, joined, a);
+    const inside = std.mem.eql(u8, real, root) or
+        (std.mem.startsWith(u8, real, root) and (root[root.len - 1] == std.fs.path.sep or real[root.len] == std.fs.path.sep));
+    if (!inside) return error.OutsideRoot;
+    return cwd.readFileAlloc(io, real, alloc, .limited(max_file_bytes));
+}
+
 fn readTextFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(8 * 1024 * 1024));
+    const root = mcp.envAlloc(alloc, io, "ZMCP_MD_ROOT");
+    defer if (root) |r| alloc.free(r);
+    const eff: ?[]const u8 = if (root) |r| (if (r.len > 0) r else null) else null;
+    return readTextFileIn(alloc, io, eff, path);
 }
 
 fn trimCR(line: []const u8) []const u8 {
@@ -639,4 +661,54 @@ fn handleExtractCode(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value)
         blocks.deinit(alloc);
     }
     return .{ .text = try blocksToJson(alloc, blocks.items) };
+}
+
+test "readTextFileIn confines to root" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "root", .default_dir);
+    try tmp.dir.createDir(io, "root-evil", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/a.md", .data = "# hi" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root-evil/b.md", .data = "secret" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.md", .data = "secret" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..n];
+    const root = try std.fmt.allocPrint(gpa, "{s}/root", .{base});
+    defer gpa.free(root);
+
+    const ok = try readTextFileIn(gpa, io, root, "a.md");
+    defer gpa.free(ok);
+    try std.testing.expectEqualStrings("# hi", ok);
+
+    const abs_in = try std.fmt.allocPrint(gpa, "{s}/a.md", .{root});
+    defer gpa.free(abs_in);
+    const ok2 = try readTextFileIn(gpa, io, root, abs_in);
+    gpa.free(ok2);
+
+    try std.testing.expectError(error.OutsideRoot, readTextFileIn(gpa, io, root, "../outside.md"));
+    // sibling directory sharing the root's name as a prefix
+    try std.testing.expectError(error.OutsideRoot, readTextFileIn(gpa, io, root, "../root-evil/b.md"));
+    const abs_evil = try std.fmt.allocPrint(gpa, "{s}/root-evil/b.md", .{base});
+    defer gpa.free(abs_evil);
+    try std.testing.expectError(error.OutsideRoot, readTextFileIn(gpa, io, root, abs_evil));
+    try std.testing.expectError(error.OutsideRoot, readTextFileIn(gpa, io, root, "/etc/passwd"));
+    // fail closed on missing file, empty path, NUL
+    try std.testing.expectError(error.FileNotFound, readTextFileIn(gpa, io, root, "missing.md"));
+    try std.testing.expectError(error.InvalidPath, readTextFileIn(gpa, io, root, ""));
+    try std.testing.expectError(error.InvalidPath, readTextFileIn(gpa, io, root, "a.md\x00../x"));
+    try std.testing.expectError(error.RootNotAccessible, readTextFileIn(gpa, io, "/nonexistent-zmcp-root", "a.md"));
+}
+
+test "md_render_file refuses /etc/passwd by default" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var map: std.json.ObjectMap = .{};
+    try map.put(arena, "path", .{ .string = "/etc/passwd" });
+    const r = try handleRenderFile(arena, std.testing.io, .{ .object = map });
+    try std.testing.expect(r.is_error);
 }

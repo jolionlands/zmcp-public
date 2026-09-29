@@ -25,14 +25,15 @@ pub fn main(init: std.process.Init) !void {
 const tool_table = [_]mcp.ToolDef{
     .{
         .name = "fs_glob",
-        .description = "Glob for files matching a pattern. Supports *, **, ?, {a,b} alternates, [abc] char classes. Returns newline-separated paths (forward-slash), capped at 1000 entries. Skips .git/ always.",
+        .description = "Glob for files matching a pattern. Supports *, **, ?, {a,b} alternates, [abc] char classes. Returns newline-separated paths (forward-slash), capped at 1000 entries. Skips .git/ always. A `cwd` with `..` or an absolute path outside the process cwd is refused unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
         \\    "pattern":   { "type": "string", "description": "Glob pattern, e.g. \"**/*.zig\"" },
         \\    "cwd":       { "type": "string", "description": "Base directory (default: process cwd)" },
-        \\    "gitignore": { "type": "boolean", "description": "Honour nearest .gitignore (default true)" }
+        \\    "gitignore": { "type": "boolean", "description": "Honour nearest .gitignore (default true)" },
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "required": ["pattern"],
         \\  "additionalProperties": false
@@ -43,12 +44,13 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "fs_stat",
-        .description = "Return file metadata: size (bytes), kind (file/dir/symlink/other), mtime_ms (Unix ms).",
+        .description = "Return file metadata: size (bytes), kind (file/dir/symlink/other), mtime_ms (Unix ms). Paths with `..` or absolute paths outside cwd are refused unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
-        \\    "path": { "type": "string", "description": "Path to stat" }
+        \\    "path": { "type": "string", "description": "Path to stat" },
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "required": ["path"],
         \\  "additionalProperties": false
@@ -59,13 +61,14 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "fs_tree",
-        .description = "Print a directory tree like `tree -L <depth>`. Default depth 3.",
+        .description = "Print a directory tree like `tree -L <depth>`. Default depth 3. Paths with `..` or absolute paths outside cwd are refused unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
         \\    "path":  { "type": "string",  "description": "Root directory (default: .)" },
-        \\    "depth": { "type": "integer", "description": "Max depth (default 3, max 20)" }
+        \\    "depth": { "type": "integer", "description": "Max depth (default 3, max 20)" },
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "additionalProperties": false
         \\}
@@ -75,13 +78,14 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "fs_mkdir",
-        .description = "Create a directory. Set recursive=true to create parent directories.",
+        .description = "Create a directory. Set recursive=true to create parent directories. Paths with `..` or absolute paths outside cwd are refused unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
         \\    "path":      { "type": "string",  "description": "Directory path to create" },
-        \\    "recursive": { "type": "boolean", "description": "Create parents if needed (default false)" }
+        \\    "recursive": { "type": "boolean", "description": "Create parents if needed (default false)" },
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "required": ["path"],
         \\  "additionalProperties": false
@@ -91,14 +95,14 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "fs_rename",
-        .description = "Rename or move a file or directory. Both paths must be below cwd unless allow_outside=true.",
+        .description = "Rename or move a file or directory. Both paths must be relative to and inside cwd (no `..`, no absolute paths outside cwd) unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
         \\    "src":           { "type": "string",  "description": "Source path" },
         \\    "dst":           { "type": "string",  "description": "Destination path" },
-        \\    "allow_outside": { "type": "boolean", "description": "Allow paths above cwd (default false)" }
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "required": ["src", "dst"],
         \\  "additionalProperties": false
@@ -109,14 +113,14 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "fs_remove",
-        .description = "Delete a file or directory. Set recursive=true for non-empty directories. Path must be below cwd unless allow_outside=true.",
+        .description = "Delete a file or directory. Set recursive=true for non-empty directories. Path must be relative to and inside cwd (no `..`, no absolute paths outside cwd) unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
         \\    "path":          { "type": "string",  "description": "Path to delete" },
         \\    "recursive":     { "type": "boolean", "description": "Delete directory recursively (default false)" },
-        \\    "allow_outside": { "type": "boolean", "description": "Allow paths above cwd (default false)" }
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "required": ["path"],
         \\  "additionalProperties": false
@@ -127,12 +131,13 @@ const tool_table = [_]mcp.ToolDef{
     },
     .{
         .name = "fs_touch",
-        .description = "Create an empty file if it does not exist, or update its mtime to now.",
+        .description = "Create an empty file if it does not exist, or update its mtime to now. Paths with `..` or absolute paths outside cwd are refused unless allow_outside=true or ZMCP_FS_ALLOW_OUTSIDE=1.",
         .input_schema_json =
         \\{
         \\  "type": "object",
         \\  "properties": {
-        \\    "path": { "type": "string", "description": "File path" }
+        \\    "path": { "type": "string", "description": "File path" },
+        \\    "allow_outside": { "type": "boolean", "description": "Allow paths outside cwd (default false; env ZMCP_FS_ALLOW_OUTSIDE=1 also enables)" }
         \\  },
         \\  "required": ["path"],
         \\  "additionalProperties": false
@@ -154,6 +159,31 @@ fn hasParentTraversal(p: []const u8) bool {
     }
     return false;
 }
+
+fn isAbsolutePath(p: []const u8) bool {
+    if (p.len > 0 and (p[0] == '/' or p[0] == '\\')) return true;
+    return p.len > 1 and p[1] == ':' and std.ascii.isAlphabetic(p[0]);
+}
+
+/// True when `p` leaves the working directory: a `..` component, or an
+/// absolute path that is not lexically under cwd. Symlinks are not resolved.
+fn escapesCwd(alloc: std.mem.Allocator, io: std.Io, p: []const u8) bool {
+    if (hasParentTraversal(p)) return true;
+    if (!isAbsolutePath(p)) return false;
+    const cwd = std.process.currentPathAlloc(io, alloc) catch return true;
+    defer alloc.free(cwd);
+    if (!std.mem.startsWith(u8, p, cwd)) return true;
+    return p.len > cwd.len and p[cwd.len] != '/' and p[cwd.len] != '\\';
+}
+
+fn outsideAllowed(alloc: std.mem.Allocator, io: std.Io, arg: bool) bool {
+    if (arg) return true;
+    const v = mcp.envAlloc(alloc, io, "ZMCP_FS_ALLOW_OUTSIDE") orelse return false;
+    defer alloc.free(v);
+    return std.mem.eql(u8, v, "1");
+}
+
+const outside_msg = "error: path is outside the working directory (relative paths only; set ZMCP_FS_ALLOW_OUTSIDE=1 or allow_outside=true to override)";
 
 /// Normalise path separators to forward-slash in-place.
 fn normSep(buf: []u8) void {
@@ -341,6 +371,10 @@ fn handleGlob(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !m
         return .{ .text = "error: missing 'pattern' argument", .is_error = true };
     const cwd_arg = getStringArg(args, "cwd");
     const use_gitignore = getBoolArg(args, "gitignore", true);
+    if (cwd_arg) |cp| {
+        if (escapesCwd(allocator, io, cp) and !outsideAllowed(allocator, io, getBoolArg(args, "allow_outside", false)))
+            return .{ .text = outside_msg, .is_error = true };
+    }
 
     const cwd_dir = std.Io.Dir.cwd();
 
@@ -410,6 +444,8 @@ fn handleGlob(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !m
 fn handleStat(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !mcp.ToolResult {
     const p = getStringArg(args, "path") orelse
         return .{ .text = "error: missing 'path' argument", .is_error = true };
+    if (escapesCwd(allocator, io, p) and !outsideAllowed(allocator, io, getBoolArg(args, "allow_outside", false)))
+        return .{ .text = outside_msg, .is_error = true };
 
     const cwd = std.Io.Dir.cwd();
     const s = cwd.statFile(io, p, .{}) catch |err| {
@@ -502,6 +538,8 @@ fn handleTree(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !m
     const path_arg = getStringArg(args, "path") orelse ".";
     const depth_arg = getIntArg(args, "depth", 3);
     const max_depth: usize = @intCast(@min(20, @max(1, depth_arg)));
+    if (escapesCwd(allocator, io, path_arg) and !outsideAllowed(allocator, io, getBoolArg(args, "allow_outside", false)))
+        return .{ .text = outside_msg, .is_error = true };
 
     const cwd = std.Io.Dir.cwd();
     var root_dir = cwd.openDir(io, path_arg, .{ .iterate = true }) catch |err| {
@@ -533,6 +571,8 @@ fn handleMkdir(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !
     const p = getStringArg(args, "path") orelse
         return .{ .text = "error: missing 'path' argument", .is_error = true };
     const recursive = getBoolArg(args, "recursive", false);
+    if (escapesCwd(allocator, io, p) and !outsideAllowed(allocator, io, getBoolArg(args, "allow_outside", false)))
+        return .{ .text = outside_msg, .is_error = true };
 
     const cwd = std.Io.Dir.cwd();
     if (recursive) {
@@ -560,7 +600,9 @@ fn handleRename(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) 
         return .{ .text = "error: missing 'dst' argument", .is_error = true };
     const allow_outside = getBoolArg(args, "allow_outside", false);
 
-    if (!allow_outside) {
+    if (!outsideAllowed(allocator, io, allow_outside)) {
+        if (escapesCwd(allocator, io, src) or escapesCwd(allocator, io, dst))
+            return .{ .text = outside_msg, .is_error = true };
         if (hasParentTraversal(src))
             return .{ .text = "error: src path traverses above cwd (use allow_outside=true to override)", .is_error = true };
         if (hasParentTraversal(dst))
@@ -584,8 +626,8 @@ fn handleRemove(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) 
     const recursive = getBoolArg(args, "recursive", false);
     const allow_outside = getBoolArg(args, "allow_outside", false);
 
-    if (!allow_outside and hasParentTraversal(p))
-        return .{ .text = "error: path traverses above cwd (use allow_outside=true to override)", .is_error = true };
+    if (!outsideAllowed(allocator, io, allow_outside) and escapesCwd(allocator, io, p))
+        return .{ .text = outside_msg, .is_error = true };
 
     const cwd = std.Io.Dir.cwd();
 
@@ -619,6 +661,8 @@ fn handleRemove(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) 
 fn handleTouch(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) !mcp.ToolResult {
     const p = getStringArg(args, "path") orelse
         return .{ .text = "error: missing 'path' argument", .is_error = true };
+    if (escapesCwd(allocator, io, p) and !outsideAllowed(allocator, io, getBoolArg(args, "allow_outside", false)))
+        return .{ .text = outside_msg, .is_error = true };
 
     const cwd = std.Io.Dir.cwd();
 
@@ -699,6 +743,7 @@ test "fs_glob finds .zig files" {
     try map.put(arena, "pattern", .{ .string = "**/*.zig" });
     try map.put(arena, "cwd", .{ .string = tmp_path });
     try map.put(arena, "gitignore", .{ .bool = false });
+    try map.put(arena, "allow_outside", .{ .bool = true });
 
     const result = try handleGlob(arena, io, .{ .object = map });
     try std.testing.expect(!result.is_error);
@@ -730,6 +775,7 @@ test "fs_tree output format" {
     defer map.deinit(arena);
     try map.put(arena, "path", .{ .string = tmp_path });
     try map.put(arena, "depth", .{ .integer = 3 });
+    try map.put(arena, "allow_outside", .{ .bool = true });
 
     const result = try handleTree(arena, io, .{ .object = map });
     try std.testing.expect(!result.is_error);
@@ -761,6 +807,7 @@ test "fs_mkdir recursive creates parents" {
     defer map.deinit(arena);
     try map.put(arena, "path", .{ .string = nested });
     try map.put(arena, "recursive", .{ .bool = true });
+    try map.put(arena, "allow_outside", .{ .bool = true });
 
     const result = try handleMkdir(arena, io, .{ .object = map });
     try std.testing.expect(!result.is_error);
@@ -801,6 +848,7 @@ test "fs_rename moves file; fs_stat confirms" {
     var stat_map: std.json.ObjectMap = .{};
     defer stat_map.deinit(arena);
     try stat_map.put(arena, "path", .{ .string = dst_path });
+    try stat_map.put(arena, "allow_outside", .{ .bool = true });
 
     const stat_result = try handleStat(arena, io, .{ .object = stat_map });
     try std.testing.expect(!stat_result.is_error);
@@ -888,5 +936,53 @@ test "fs_remove path safety rejects .." {
 
     const result = try handleRemove(arena, io, .{ .object = map });
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.text, "traverses") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "outside the working directory") != null);
+}
+
+test "fs_remove refuses absolute paths outside cwd" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var map: std.json.ObjectMap = .{};
+    try map.put(arena, "path", .{ .string = "/etc/zmcp-should-never-be-touched" });
+    try map.put(arena, "recursive", .{ .bool = true });
+    const result = try handleRemove(arena, std.testing.io, .{ .object = map });
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "outside the working directory") != null);
+}
+
+test "read tools and mkdir/touch refuse outside-cwd paths by default" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    var m1: std.json.ObjectMap = .{};
+    try m1.put(arena, "path", .{ .string = "/etc/shadow" });
+    const r1 = try handleStat(arena, io, .{ .object = m1 });
+    try std.testing.expect(r1.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, r1.text, "outside the working directory") != null);
+
+    var m2: std.json.ObjectMap = .{};
+    try m2.put(arena, "path", .{ .string = "../.." });
+    const r2 = try handleTree(arena, io, .{ .object = m2 });
+    try std.testing.expect(r2.is_error);
+
+    var m3: std.json.ObjectMap = .{};
+    try m3.put(arena, "pattern", .{ .string = "*" });
+    try m3.put(arena, "cwd", .{ .string = "/etc" });
+    const r3 = try handleGlob(arena, io, .{ .object = m3 });
+    try std.testing.expect(r3.is_error);
+
+    var m4: std.json.ObjectMap = .{};
+    try m4.put(arena, "path", .{ .string = "/tmp/zmcp-should-not-exist-dir" });
+    const r4 = try handleMkdir(arena, io, .{ .object = m4 });
+    try std.testing.expect(r4.is_error);
+
+    var m5: std.json.ObjectMap = .{};
+    try m5.put(arena, "path", .{ .string = "/tmp/zmcp-should-not-exist-file" });
+    const r5 = try handleTouch(arena, io, .{ .object = m5 });
+    try std.testing.expect(r5.is_error);
 }

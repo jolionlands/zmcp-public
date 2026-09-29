@@ -149,7 +149,7 @@ const Prepared = struct {
 };
 
 /// Slice = profile rules, plus the gateway's own ZMCP_TOOLS_DENY /
-/// ZMCP_READONLY (ZMCP_TOOLS only when the profile has no allowlist).
+/// ZMCP_READONLY / ZMCP_NO_DESTRUCTIVE (ZMCP_TOOLS only when the profile has no allowlist).
 fn effectiveSlice(a: std.mem.Allocator, env: *const std.process.Environ.Map, base: profile.Slice) !profile.Slice {
     var sl = base;
     if (sl.allow.len == 0) sl.allow = try mcp.parseNameList(a, env.get("ZMCP_TOOLS"));
@@ -165,6 +165,10 @@ fn effectiveSlice(a: std.mem.Allocator, env: *const std.process.Environ.Map, bas
     if (env.get("ZMCP_READONLY")) |r| {
         const t = std.mem.trim(u8, r, " \t\r\n");
         if (std.mem.eql(u8, t, "1") or std.ascii.eqlIgnoreCase(t, "true") or std.ascii.eqlIgnoreCase(t, "yes")) sl.readonly = true;
+    }
+    if (env.get("ZMCP_NO_DESTRUCTIVE")) |r| {
+        const t = std.mem.trim(u8, r, " \t\r\n");
+        if (std.mem.eql(u8, t, "1") or std.ascii.eqlIgnoreCase(t, "true") or std.ascii.eqlIgnoreCase(t, "yes")) sl.no_destructive = true;
     }
     return sl;
 }
@@ -195,7 +199,7 @@ fn prepare(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: *const
         };
         label = try arena.dupe(u8, p.name);
         requested = try dupeList(arena, p.servers);
-        base_slice = .{ .allow = try dupeList(arena, p.slice.allow), .deny = try dupeList(arena, p.slice.deny), .readonly = p.slice.readonly };
+        base_slice = .{ .allow = try dupeList(arena, p.slice.allow), .deny = try dupeList(arena, p.slice.deny), .readonly = p.slice.readonly, .no_destructive = p.slice.no_destructive };
         context = try std.fmt.allocPrint(arena, "profile '{s}'", .{p.name});
     }
     if (args.servers) |s| {
@@ -308,6 +312,7 @@ fn cmdProfiles(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: *c
         if (p.slice.allow.len > 0) try out.print("  allow={d}", .{p.slice.allow.len});
         if (p.slice.deny.len > 0) try out.print("  deny={d}", .{p.slice.deny.len});
         if (p.slice.readonly) try out.writeAll("  readonly");
+        if (p.slice.no_destructive) try out.writeAll("  no_destructive");
         try out.writeAll("\n");
     }
     try out.flush();

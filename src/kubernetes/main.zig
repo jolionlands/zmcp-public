@@ -30,7 +30,7 @@ const tool_table = [_]mcp.ToolDef{
     .{
         .name = "kubectl_get",
         .read_only = true,
-        .description = "kubectl get (read-only). JSON output is compacted (managedFields stripped, Secret data redacted).",
+        .description = "kubectl get (read-only). JSON output is compacted (managedFields stripped) and redacted: Secret data/stringData values, container env[].value whose NAME looks secret-like (password, secret, token, key, credential, passwd, auth) and ConfigMap values whose KEY looks secret-like. Redaction is name-based and best effort: secrets stored under innocuous names or in other fields (args, annotations, CRDs) are not detected. Output that is not valid JSON is refused rather than returned raw.",
         .input_schema_json =
         \\{"type":"object","properties":{"resourceType":{"type":"string"},"name":{"type":"string"},"namespace":{"type":"string"},"output":{"type":"string","enum":["json","name"],"default":"json"},"allNamespaces":{"type":"boolean"},"labelSelector":{"type":"string"},"fieldSelector":{"type":"string"},"sortBy":{"type":"string","description":"JSONPath e.g. .metadata.creationTimestamp"},"context":{"type":"string"}},"required":["resourceType"]}
         ,
@@ -39,7 +39,7 @@ const tool_table = [_]mcp.ToolDef{
     .{
         .name = "kubectl_describe",
         .read_only = true,
-        .description = "kubectl describe a resource (read-only).",
+        .description = "kubectl describe a resource (read-only). Refuses resourceType secret (values are never returned; use kubectl_get, which redacts). Output is passed through a best-effort text scrubber that masks Data/Environment values under secret-like names, long base64-like values, private key blocks, Bearer tokens and URL passwords. This is a heuristic: secrets under innocuous names or free-form text can still appear.",
         .input_schema_json =
         \\{"type":"object","properties":{"resourceType":{"type":"string"},"name":{"type":"string"},"namespace":{"type":"string"},"allNamespaces":{"type":"boolean"},"context":{"type":"string"}},"required":["resourceType","name"]}
         ,
@@ -48,7 +48,7 @@ const tool_table = [_]mcp.ToolDef{
     .{
         .name = "kubectl_logs",
         .read_only = true,
-        .description = "Container logs (tail capped at 1000, default 200; never follows).",
+        .description = "Container logs (tail capped at 1000, default 200; never follows). Output goes through the same best-effort secret scrubber as kubectl_describe (name=value pairs with secret-like names, Bearer tokens, URL passwords, private keys); logs are free-form, so this is a heuristic and not a guarantee.",
         .input_schema_json =
         \\{"type":"object","properties":{"resourceType":{"type":"string","enum":["pod","deployment","job","cronjob"],"default":"pod"},"name":{"type":"string"},"namespace":{"type":"string"},"container":{"type":"string"},"tail":{"type":"integer","minimum":1,"maximum":1000},"since":{"type":"string","description":"e.g. 10m, 2h"},"previous":{"type":"boolean"},"timestamps":{"type":"boolean"},"context":{"type":"string"}},"required":["name"]}
         ,
@@ -405,6 +405,19 @@ fn runText(alloc: std.mem.Allocator, io: Io, av: *Argv, stdin_text: ?[]const u8)
     }
 }
 
+/// Like runText but passes stdout through `scrubOutput` before capping.
+fn runScrubbed(alloc: std.mem.Allocator, io: Io, av: *Argv) !mcp.ToolResult {
+    if (av.bad) |b| return .{ .text = b, .is_error = true };
+    switch (try runKubectl(alloc, io, av.list.items, null)) {
+        .err => |r| return r,
+        .ok => |out| {
+            const t = std.mem.trim(u8, out, "\r\n");
+            if (t.len == 0) return .{ .text = "(no output)" };
+            return .{ .text = try capText(alloc, try scrubOutput(alloc, t)) };
+        },
+    }
+}
+
 fn requireWrite(alloc: std.mem.Allocator, what: []const u8) !?mcp.ToolResult {
     if (allow_write) return null;
     return try fail(alloc, "refused: {s} modifies the cluster; set ZMCP_KUBERNETES_ALLOW_WRITE=1 in the server environment to enable write tools", .{what});
@@ -452,10 +465,327 @@ fn compactValue(v: *std.json.Value) void {
     }
 }
 
+/// Env / config key names that look secret-like (case-insensitive substring).
+const secret_words = [_][]const u8{ "password", "secret", "token", "key", "credential", "passwd", "auth" };
+
+fn nameLooksSecret(name: []const u8) bool {
+    for (secret_words) |w| if (std.ascii.indexOfIgnoreCase(name, w) != null) return true;
+    return false;
+}
+
+/// Narrower list for free-form lines (logs), to keep false positives down.
+const narrow_words = [_][]const u8{ "password", "passwd", "secret", "token", "credential", "apikey", "api_key", "api-key", "authorization", "private_key", "private-key", "access_key", "access-key" };
+
+fn nameLooksSecretNarrow(name: []const u8) bool {
+    for (narrow_words) |w| if (std.ascii.indexOfIgnoreCase(name, w) != null) return true;
+    return false;
+}
+
+const REDACTED_VALUE = "<redacted>";
+
+/// A value that is secret regardless of its name: PEM private key or URL with
+/// user:pass@ userinfo.
+fn valueLooksSecret(v: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(v, "PRIVATE KEY-----") != null) return true;
+    if (std.mem.indexOf(u8, v, "://")) |i| {
+        const rest = v[i + 3 ..];
+        var e: usize = 0;
+        while (e < rest.len and rest[e] != '/' and rest[e] != '?' and rest[e] != ' ') e += 1;
+        if (std.mem.indexOfScalar(u8, rest[0..e], '@')) |at| {
+            if (std.mem.indexOfScalar(u8, rest[0..at], ':') != null) return true;
+        }
+    }
+    return false;
+}
+
+/// Redact, in place and at any depth: container env[].value with a secret-like
+/// NAME (or a secret-looking value), and ConfigMap data/binaryData values whose
+/// KEY is secret-like (or whose value looks secret).
+fn redactWorkloadValues(v: *std.json.Value, depth: usize) void {
+    if (depth > 64) return;
+    switch (v.*) {
+        .array => |*arr| for (arr.items) |*x| redactWorkloadValues(x, depth + 1),
+        .object => |*obj| {
+            var is_cm = false;
+            if (obj.get("kind")) |k| {
+                if (k == .string and std.mem.eql(u8, k.string, "ConfigMap")) is_cm = true;
+            }
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                const key = e.key_ptr.*;
+                const val = e.value_ptr;
+                if (std.mem.eql(u8, key, "env") and val.* == .array) {
+                    for (val.array.items) |*item| {
+                        if (item.* != .object) continue;
+                        const nm = item.object.get("name") orelse continue;
+                        const vp = item.object.getPtr("value") orelse continue;
+                        if (nm != .string or vp.* != .string) continue;
+                        if (nameLooksSecret(nm.string) or valueLooksSecret(vp.string)) vp.* = .{ .string = REDACTED_VALUE };
+                    }
+                } else if (is_cm and (std.mem.eql(u8, key, "data") or std.mem.eql(u8, key, "binaryData")) and val.* == .object) {
+                    var dit = val.object.iterator();
+                    while (dit.next()) |de| {
+                        if (de.value_ptr.* != .string) continue;
+                        if (nameLooksSecret(de.key_ptr.*) or valueLooksSecret(de.value_ptr.string)) de.value_ptr.* = .{ .string = REDACTED_VALUE };
+                    }
+                }
+                redactWorkloadValues(val, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+/// Compact + redact kubectl JSON. Errors (never raw output) when the input is
+/// not valid JSON, since it could then carry unredacted secrets.
 fn compactJson(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    var parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{}) catch return raw;
+    var parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
     compactValue(&parsed);
+    redactWorkloadValues(&parsed, 0);
     return std.json.Stringify.valueAlloc(alloc, parsed, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Best-effort text scrubber for describe / logs (heuristic; see tool docs)
+// ---------------------------------------------------------------------------
+
+const REDACTED_TEXT = "[redacted]";
+
+/// True for `secret`, `secrets`, `secret/x`, `secrets.v1.`, `pods,secrets`.
+fn isSecretType(rt: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, rt, ',');
+    while (it.next()) |part| {
+        var end: usize = 0;
+        while (end < part.len and part[end] != '.' and part[end] != '/') end += 1;
+        var w = part[0..end];
+        if (w.len > 0 and (w[w.len - 1] == 's' or w[w.len - 1] == 'S')) w = w[0 .. w.len - 1];
+        if (std.ascii.eqlIgnoreCase(w, "secret")) return true;
+    }
+    return false;
+}
+
+fn isNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
+}
+
+fn isValueEnd(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '"', '\'', ',', ';', '&', '}', ']', '\r' => true,
+        else => false,
+    };
+}
+
+fn isB64Char(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=' or c == '_' or c == '-';
+}
+
+fn isLongB64(v: []const u8) bool {
+    if (v.len < 32) return false;
+    for (v) |c| if (!isB64Char(c)) return false;
+    return true;
+}
+
+fn replaceRange(alloc: std.mem.Allocator, s: []const u8, a: usize, b: usize, with: []const u8) ![]const u8 {
+    return std.mem.concat(alloc, u8, &.{ s[0..a], with, s[b..] });
+}
+
+/// Mask the token after `Bearer ` / `Basic `.
+fn scrubBearer(alloc: std.mem.Allocator, line: []const u8) ![]const u8 {
+    var cur = line;
+    for ([_][]const u8{ "bearer ", "basic " }) |n| {
+        var from: usize = 0;
+        while (std.ascii.indexOfIgnoreCasePos(cur, from, n)) |i| {
+            if (i > 0 and isNameChar(cur[i - 1])) {
+                from = i + n.len;
+                continue;
+            }
+            const vs = i + n.len;
+            var ve = vs;
+            while (ve < cur.len and !isValueEnd(cur[ve])) ve += 1;
+            // "Basic" is common English: only mask when it looks like a credential.
+            const is_basic = n[0] == 'b' and n[1] == 'a';
+            if (ve == vs or std.mem.startsWith(u8, cur[vs..ve], REDACTED_TEXT) or (is_basic and !isLongB64(cur[vs..ve]))) {
+                from = ve;
+                continue;
+            }
+            cur = try replaceRange(alloc, cur, vs, ve, REDACTED_TEXT);
+            from = vs + REDACTED_TEXT.len;
+        }
+    }
+    return cur;
+}
+
+/// Mask userinfo passwords in scheme://user:pass@host.
+fn scrubUserinfo(alloc: std.mem.Allocator, line: []const u8) ![]const u8 {
+    var cur = line;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, cur, from, "://")) |i| {
+        const as = i + 3;
+        var ae = as;
+        while (ae < cur.len and cur[ae] != '/' and cur[ae] != '?' and cur[ae] != '#' and cur[ae] != ' ' and cur[ae] != '"' and cur[ae] != '\'' and cur[ae] != '\t') ae += 1;
+        from = as;
+        const at = std.mem.lastIndexOfScalar(u8, cur[as..ae], '@') orelse continue;
+        if (std.mem.eql(u8, cur[as .. as + at], REDACTED_TEXT)) continue;
+        cur = try replaceRange(alloc, cur, as, as + at, REDACTED_TEXT);
+        from = as + REDACTED_TEXT.len;
+    }
+    return cur;
+}
+
+/// Mask values of `name=value` / `name: value` / `"name":"value"` pairs whose
+/// name looks secret-like. `strict` uses the broad word list (env/data sections).
+fn scrubKeyValues(alloc: std.mem.Allocator, line: []const u8, strict: bool) ![]const u8 {
+    var cur = line;
+    var i: usize = 0;
+    while (i < cur.len) : (i += 1) {
+        const c = cur[i];
+        if (c != ':' and c != '=') continue;
+        var ne = i;
+        while (ne > 0 and (cur[ne - 1] == '"' or cur[ne - 1] == '\'')) ne -= 1;
+        var ns = ne;
+        while (ns > 0 and isNameChar(cur[ns - 1])) ns -= 1;
+        const name = cur[ns..ne];
+        if (name.len == 0) continue;
+        if (!(if (strict) nameLooksSecret(name) else nameLooksSecretNarrow(name))) continue;
+        var vs = i + 1;
+        while (vs < cur.len and (cur[vs] == ' ' or cur[vs] == '\t' or cur[vs] == '"' or cur[vs] == '\'')) vs += 1;
+        if (std.mem.startsWith(u8, cur[vs..], "//")) continue; // scheme://
+        var ve = vs;
+        while (ve < cur.len and !isValueEnd(cur[ve])) ve += 1;
+        if (ve == vs) continue;
+        const val = cur[vs..ve];
+        if (val[0] == '<' or std.mem.startsWith(u8, val, REDACTED_TEXT)) continue;
+        cur = try replaceRange(alloc, cur, vs, ve, REDACTED_TEXT);
+        i = vs + REDACTED_TEXT.len - 1;
+    }
+    return cur;
+}
+
+fn scrubLine(alloc: std.mem.Allocator, line: []const u8, strict: bool) ![]const u8 {
+    var l = try scrubBearer(alloc, line);
+    l = try scrubUserinfo(alloc, l);
+    return scrubKeyValues(alloc, l, strict);
+}
+
+fn indentOf(l: []const u8) usize {
+    var n: usize = 0;
+    while (n < l.len and (l[n] == ' ' or l[n] == '\t')) n += 1;
+    return n;
+}
+
+const Section = enum { none, data, env };
+
+/// Heuristic scrubber for `kubectl describe` and `logs` text. Masks:
+///   * PEM private key blocks;
+///   * Data / String Data / BinaryData values (describe configmap layout) whose
+///     key is secret-like, or that hold long base64-like or private-key text;
+///   * `NAME:  value` lines under `Environment:` whose NAME is secret-like or
+///     whose value is long base64-like;
+///   * secret-named key=value pairs, Bearer tokens and URL passwords anywhere.
+/// It cannot know what is secret: values under innocuous names get through.
+pub fn scrubOutput(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var sp = std.mem.splitScalar(u8, text, '\n');
+    while (sp.next()) |l| try lines.append(alloc, std.mem.trimEnd(u8, l, "\r"));
+
+    var out: std.ArrayList(u8) = .empty;
+    var section: Section = .none;
+    var sec_indent: usize = 0;
+    var in_pem = false;
+    var i: usize = 0;
+    while (i < lines.items.len) {
+        const line = lines.items[i];
+        const trimmed = std.mem.trim(u8, line, " \t");
+        // PEM blocks: hide from BEGIN..PRIVATE KEY through END.
+        if (in_pem) {
+            if (std.mem.indexOf(u8, line, "-----END") != null) in_pem = false;
+            i += 1;
+            continue;
+        }
+        if (std.ascii.indexOfIgnoreCase(line, "-----BEGIN") != null and std.ascii.indexOfIgnoreCase(line, "PRIVATE KEY") != null) {
+            try out.appendSlice(alloc, "[redacted private key block]\n");
+            in_pem = std.mem.indexOf(u8, line, "-----END") == null;
+            i += 1;
+            continue;
+        }
+        // Section tracking.
+        if (section == .env and trimmed.len > 0 and indentOf(line) <= sec_indent) section = .none;
+        if (section == .data and (std.mem.eql(u8, trimmed, "Events:") or std.mem.startsWith(u8, trimmed, "Events:"))) section = .none;
+        const next_is_rule = i + 1 < lines.items.len and std.mem.startsWith(u8, lines.items[i + 1], "====");
+        if (next_is_rule and (std.mem.eql(u8, trimmed, "Data") or std.mem.eql(u8, trimmed, "String Data") or std.mem.eql(u8, trimmed, "StringData") or std.mem.eql(u8, trimmed, "BinaryData"))) {
+            section = .data;
+            sec_indent = indentOf(line);
+        } else if (std.mem.startsWith(u8, trimmed, "Environment:") and std.mem.trim(u8, trimmed["Environment:".len..], " \t").len == 0) {
+            section = .env;
+            sec_indent = indentOf(line);
+            try out.appendSlice(alloc, line);
+            try out.append(alloc, '\n');
+            i += 1;
+            continue;
+        }
+
+        if (section == .data) {
+            // describe configmap: "key:" / "----" / value lines / blank.
+            if (trimmed.len > 1 and trimmed[trimmed.len - 1] == ':' and i + 1 < lines.items.len and std.mem.eql(u8, std.mem.trim(u8, lines.items[i + 1], " \t"), "----")) {
+                const key = trimmed[0 .. trimmed.len - 1];
+                try out.appendSlice(alloc, line);
+                try out.append(alloc, '\n');
+                try out.appendSlice(alloc, lines.items[i + 1]);
+                try out.append(alloc, '\n');
+                var j = i + 2;
+                var secretish = nameLooksSecret(key);
+                while (j < lines.items.len and std.mem.trim(u8, lines.items[j], " \t").len > 0) : (j += 1) {
+                    const vl = std.mem.trim(u8, lines.items[j], " \t");
+                    if (isLongB64(vl) or valueLooksSecret(vl)) secretish = true;
+                }
+                if (j > i + 2) {
+                    if (secretish) {
+                        try out.appendSlice(alloc, REDACTED_TEXT);
+                        try out.append(alloc, '\n');
+                    } else for (lines.items[i + 2 .. j]) |vl| {
+                        try out.appendSlice(alloc, try scrubLine(alloc, vl, false));
+                        try out.append(alloc, '\n');
+                    }
+                }
+                i = j;
+                continue;
+            }
+            // one-line "key:  value" form
+            if (try scrubPairLine(alloc, line, trimmed)) |masked| {
+                try out.appendSlice(alloc, masked);
+                try out.append(alloc, '\n');
+                i += 1;
+                continue;
+            }
+        } else if (section == .env) {
+            if (try scrubPairLine(alloc, line, trimmed)) |masked| {
+                try out.appendSlice(alloc, masked);
+                try out.append(alloc, '\n');
+                i += 1;
+                continue;
+            }
+        }
+        try out.appendSlice(alloc, try scrubLine(alloc, line, section != .none));
+        try out.append(alloc, '\n');
+        i += 1;
+    }
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') _ = out.pop();
+    return out.items;
+}
+
+/// For a `NAME:  value` line inside an Environment/Data section: returns the
+/// line with the value masked when NAME is secret-like or the value is long
+/// base64-like; null when the line needs no whole-value masking.
+fn scrubPairLine(alloc: std.mem.Allocator, line: []const u8, trimmed: []const u8) !?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return null;
+    const name = trimmed[0..colon];
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, ' ') != null) return null;
+    const val = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+    if (val.len == 0 or val[0] == '<' or std.mem.startsWith(u8, val, REDACTED_TEXT)) return null;
+    if (nameLooksSecret(name) or isLongB64(val) or valueLooksSecret(val)) {
+        return try std.fmt.allocPrint(alloc, "{s}{s}:  {s}", .{ line[0..indentOf(line)], name, REDACTED_TEXT });
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +812,12 @@ fn handleGet(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolRe
         .ok => |out| {
             const t = std.mem.trim(u8, out, "\r\n");
             if (t.len == 0) return .{ .text = "(no resources)" };
-            return .{ .text = try capText(alloc, if (as_json) try compactJson(alloc, t) else t) };
+            if (!as_json) return .{ .text = try capText(alloc, t) };
+            const compact = compactJson(alloc, t) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => return fail(alloc, "error: kubectl output was not valid JSON; refusing to return it unredacted", .{}),
+            };
+            return .{ .text = try capText(alloc, compact) };
         },
     }
 }
@@ -490,12 +825,13 @@ fn handleGet(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolRe
 fn handleDescribe(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
     const rt = getStr(args, "resourceType") orelse return fail(alloc, "resourceType is required", .{});
     const name = getStr(args, "name") orelse return fail(alloc, "name is required", .{});
+    if (isSecretType(rt) or isSecretType(name)) return fail(alloc, "refused: describe of Secrets is not supported because its output can include secret values, which this server never returns. Use kubectl_get (resourceType secret), which returns the object with data values redacted.", .{});
     var av = try Argv.init(alloc, args);
     try av.push("describe");
     try av.tok("resourceType", rt);
     try av.tok("name", name);
     try av.namespace(args, true);
-    return runText(alloc, io, &av, null);
+    return runScrubbed(alloc, io, &av);
 }
 
 fn handleLogs(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
@@ -521,7 +857,7 @@ fn handleLogs(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolR
     if (getBool(args, "previous")) try av.push("--previous");
     if (getBool(args, "timestamps")) try av.push("--timestamps");
     try av.push("--limit-bytes=65536");
-    return runText(alloc, io, &av, null);
+    return runScrubbed(alloc, io, &av);
 }
 
 fn handleTop(alloc: std.mem.Allocator, io: Io, args: std.json.Value) !mcp.ToolResult {
@@ -1029,4 +1365,132 @@ test "annotations: reads are read_only, writes destructive, rollout neither" {
         try std.testing.expectEqual(writes, t.destructive);
         try std.testing.expectEqual(!writes and !mixed, t.read_only);
     }
+}
+
+test "get: env values and configmap keys with secret-like names are redacted" {
+    var ctx: TestCtx = undefined;
+    ctx.init();
+    defer ctx.deinit();
+    fakeOk(
+        \\{"kind":"List","items":[{"kind":"Pod","metadata":{"name":"p"},"spec":{"containers":[{"name":"c","env":[{"name":"DB_PASSWORD","value":"hunter2"},{"name":"REGION","value":"eu"},{"name":"API_KEY","valueFrom":{"secretKeyRef":{"name":"s","key":"k"}}},{"name":"DSN","value":"postgres://u:pw@h/db"}]}]}},
+        \\{"kind":"Deployment","spec":{"template":{"spec":{"initContainers":[{"env":[{"name":"AUTH_TOKEN","value":"tok123"}]}]}}}},
+        \\{"kind":"ConfigMap","metadata":{"name":"cm"},"data":{"app.conf":"x=1","db_password":"pw999","tls.key":"kkk"}}]}
+    );
+    const res = try handleGet(ctx.arena, std.testing.io, try ctx.args("{\"resourceType\":\"all\"}"));
+    try std.testing.expect(!res.is_error);
+    for ([_][]const u8{ "hunter2", "tok123", "pw999", "kkk", "u:pw" }) |bad|
+        try std.testing.expect(std.mem.indexOf(u8, res.text, bad) == null);
+    for ([_][]const u8{ "\"eu\"", "x=1", "secretKeyRef" }) |good|
+        try std.testing.expect(std.mem.indexOf(u8, res.text, good) != null);
+}
+
+test "get: non-JSON output is refused, not returned raw" {
+    var ctx: TestCtx = undefined;
+    ctx.init();
+    defer ctx.deinit();
+    fakeOk("password: hunter2 (not json)");
+    const res = try handleGet(ctx.arena, std.testing.io, try ctx.args("{\"resourceType\":\"pods\"}"));
+    try std.testing.expect(res.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, res.text, "hunter2") == null);
+}
+
+test "describe: secret types refused without exec" {
+    var ctx: TestCtx = undefined;
+    ctx.init();
+    defer ctx.deinit();
+    for ([_][]const u8{ "secret", "secrets", "Secret", "secrets.v1.", "secret/foo", "pods,secrets" }) |rt| {
+        const js = try std.fmt.allocPrint(ctx.arena, "{{\"resourceType\":\"{s}\",\"name\":\"x\"}}", .{rt});
+        const r = try handleDescribe(ctx.arena, std.testing.io, try ctx.args(js));
+        try std.testing.expect(r.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "kubectl_get") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake_calls);
+    try std.testing.expect(!isSecretType("serviceaccount"));
+    try std.testing.expect(!isSecretType("pod"));
+}
+
+test "describe: pod environment section is scrubbed" {
+    var ctx: TestCtx = undefined;
+    ctx.init();
+    defer ctx.deinit();
+    fakeOk(
+        \\Name:         web
+        \\Containers:
+        \\  app:
+        \\    Image:  nginx
+        \\    Environment:
+        \\      DB_PASSWORD:  hunter2
+        \\      REGION:       eu-west-1
+        \\      API_KEY:      <set to the key 'k' in secret 's'>  Optional: false
+        \\      BLOB:         QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5
+        \\    Mounts:
+        \\      /data from vol (rw)
+        \\Events:  <none>
+    );
+    const r = try handleDescribe(ctx.arena, std.testing.io, try ctx.args("{\"resourceType\":\"pod\",\"name\":\"web\"}"));
+    try std.testing.expect(!r.is_error);
+    for ([_][]const u8{ "hunter2", "QUJDREVG" }) |bad| try std.testing.expect(std.mem.indexOf(u8, r.text, bad) == null);
+    for ([_][]const u8{ "DB_PASSWORD:  [redacted]", "REGION:       eu-west-1", "<set to the key 'k' in secret 's'>", "/data from vol (rw)", "Image:  nginx" }) |good|
+        try std.testing.expect(std.mem.indexOf(u8, r.text, good) != null);
+}
+
+test "scrubOutput: configmap data blocks, PEM, bearer, url passwords, log pairs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cm =
+        \\Name:         cm
+        \\Data
+        \\====
+        \\app.conf:
+        \\----
+        \\level=debug
+        \\
+        \\db_password:
+        \\----
+        \\pw999
+        \\
+        \\cert:
+        \\----
+        \\-----BEGIN PRIVATE KEY-----
+        \\MIIEvQIBADANBg
+        \\-----END PRIVATE KEY-----
+        \\
+        \\
+        \\BinaryData
+        \\====
+        \\
+        \\Events:  <none>
+    ;
+    const o = try scrubOutput(a, cm);
+    for ([_][]const u8{ "pw999", "MIIEvQ", "BEGIN PRIVATE" }) |bad| try std.testing.expect(std.mem.indexOf(u8, o, bad) == null);
+    try std.testing.expect(std.mem.indexOf(u8, o, "level=debug") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o, "Events:  <none>") != null);
+
+    const logs =
+        \\2024 connect postgres://admin:s3cr3t@db:5432/x ok
+        \\Authorization: Bearer abc.def.ghi
+        \\{"password":"hunter2","user":"bob"}
+        \\login token=xyz789 done
+        \\-----BEGIN RSA PRIVATE KEY-----
+        \\AAAA
+        \\-----END RSA PRIVATE KEY-----
+        \\plain line stays
+    ;
+    const l = try scrubOutput(a, logs);
+    for ([_][]const u8{ "s3cr3t", "abc.def.ghi", "hunter2", "xyz789", "AAAA" }) |bad| try std.testing.expect(std.mem.indexOf(u8, l, bad) == null);
+    for ([_][]const u8{ "admin:", "@db:5432", "\"user\":\"bob\"", "plain line stays", "connect", "done" }) |good| {
+        if (std.mem.eql(u8, good, "admin:")) continue; // userinfo is masked whole
+        try std.testing.expect(std.mem.indexOf(u8, l, good) != null);
+    }
+}
+
+test "logs: output is scrubbed" {
+    var ctx: TestCtx = undefined;
+    ctx.init();
+    defer ctx.deinit();
+    fakeOk("start password=hunter2 end\nok\n");
+    const r = try handleLogs(ctx.arena, std.testing.io, try ctx.args("{\"name\":\"web\"}"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "hunter2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "start password=[redacted] end") != null);
 }

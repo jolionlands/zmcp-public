@@ -8,8 +8,10 @@
 
 const std = @import("std");
 const mcp = @import("mcp");
+const netpolicy = @import("netpolicy");
 
 const default_max_bytes: usize = 1024 * 1024; // 1 MiB
+const hard_max_bytes: usize = 64 * 1024 * 1024; // upper bound for any max_bytes argument
 const UA_PRODUCT = "zmcp-fetch/0.1.0";
 
 // ---------------------------------------------------------------------------
@@ -115,8 +117,8 @@ fn parseArgs(alloc: std.mem.Allocator, args: std.json.Value) !ParsedArgs {
     const url = url_v.string;
 
     const max_bytes: usize = if (args.object.get("max_bytes")) |mbv| switch (mbv) {
-        .integer => |i| if (i > 0) @intCast(i) else default_max_bytes,
-        .float => |f| @intFromFloat(f),
+        .integer => |i| if (i > 0) @min(@as(usize, @intCast(i)), hard_max_bytes) else default_max_bytes,
+        .float => |fv| if (std.math.isFinite(fv) and fv >= 1) @as(usize, @intFromFloat(@min(fv, @as(f64, @floatFromInt(hard_max_bytes))))) else default_max_bytes,
         else => default_max_bytes,
     } else default_max_bytes;
 
@@ -151,9 +153,83 @@ const HttpResult = struct {
     content_type: []const u8, // duped into alloc
     head_bytes: []const u8, // duped into alloc (raw response head)
     body: []u8, // duped into alloc; empty slice for HEAD
+    /// Redirect target when the status is 3xx and a Location header was sent.
+    location: ?[]const u8 = null, // duped into alloc
 };
 
+/// URL policy for outbound requests: http(s) only, and loopback, private,
+/// link-local and intranet hosts are refused (SSRF). ZMCP_FETCH_ALLOW_PRIVATE=1
+/// lifts the host restriction. Redirects are re-checked at every hop. DNS
+/// rebinding (a public name resolving to a private address) is not detected.
+fn urlBlocked(alloc: std.mem.Allocator, io: std.Io, url: []const u8) ?[]const u8 {
+    var allow_local = false;
+    if (mcp.envAlloc(alloc, io, "ZMCP_FETCH_ALLOW_PRIVATE")) |v| {
+        defer alloc.free(v);
+        allow_local = std.mem.eql(u8, v, "1");
+    }
+    return netpolicy.check(.{ .allow_local = allow_local }, url);
+}
+
+const max_redirects: u8 = 5;
+
+fn fetchErrText(alloc: std.mem.Allocator, err: anyerror) ![]u8 {
+    if (err == error.BlockedByPolicy) {
+        // The shared policy text names the browser's override; fetch has its own.
+        const why = g_block_reason[0 .. std.mem.indexOf(u8, g_block_reason, " (set ZMCP_BROWSER") orelse g_block_reason.len];
+        return std.fmt.allocPrint(alloc, "fetch blocked: {s} (set ZMCP_FETCH_ALLOW_PRIVATE=1 to allow private hosts)", .{why});
+    }
+    return std.fmt.allocPrint(alloc, "fetch error: {s}", .{@errorName(err)});
+}
+
+/// GET/HEAD with manual redirect following so every hop passes urlBlocked.
 fn httpFetch(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    extra_headers: []const std.http.Header,
+    max_bytes: usize,
+    method: std.http.Method,
+) !HttpResult {
+    var cur: []const u8 = url;
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| alloc.free(o);
+    var hops: u8 = 0;
+    while (true) {
+        if (urlBlocked(alloc, io, cur)) |why| {
+            g_block_reason = why;
+            return error.BlockedByPolicy;
+        }
+        const res = try httpFetchHop(alloc, io, cur, extra_headers, max_bytes, method);
+        const code = @intFromEnum(res.status);
+        const loc = res.location orelse return res;
+        if (code < 300 or code > 399 or code == 304) {
+            alloc.free(loc);
+            return res;
+        }
+        if (hops >= max_redirects) return error.TooManyRedirects;
+        hops += 1;
+        const next: []u8 = blk: {
+            defer alloc.free(loc);
+            if (std.mem.indexOf(u8, loc, "://") != null) break :blk try alloc.dupe(u8, loc);
+            if (loc.len > 0 and loc[0] == '/') {
+                const se = std.mem.indexOf(u8, cur, "://") orelse return error.InvalidRedirect;
+                const ae = std.mem.indexOfAnyPos(u8, cur, se + 3, "/?#") orelse cur.len;
+                break :blk try std.fmt.allocPrint(alloc, "{s}{s}", .{ cur[0..ae], loc });
+            }
+            return error.InvalidRedirect;
+        };
+        alloc.free(res.content_type);
+        alloc.free(res.head_bytes);
+        alloc.free(res.body);
+        if (owned) |o| alloc.free(o);
+        owned = next;
+        cur = next;
+    }
+}
+
+threadlocal var g_block_reason: []const u8 = "";
+
+fn httpFetchHop(
     alloc: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
@@ -176,6 +252,7 @@ fn httpFetch(
 
     var req = try client.request(method, uri, .{
         .extra_headers = all_headers,
+        .redirect_behavior = .unhandled,
         .headers = .{ .user_agent = .omit },
     });
     defer req.deinit();
@@ -189,39 +266,31 @@ fn httpFetch(
     const head_bytes = try alloc.dupe(u8, response.head.bytes);
     const content_type = try alloc.dupe(u8, response.head.content_type orelse "");
     const status = response.head.status;
+    const location: ?[]u8 = if (response.head.location) |l| try alloc.dupe(u8, l) else null;
 
-    if (method == .HEAD) {
+    if (method == .HEAD or (location != null and @intFromEnum(status) >= 300 and @intFromEnum(status) < 400)) {
         return .{
             .status = status,
             .content_type = content_type,
             .head_bytes = head_bytes,
-            .body = &.{},
+            .body = try alloc.alloc(u8, 0),
+            .location = location,
         };
     }
 
-    // Read body with max_bytes guard.
-    // We use a Limited reader wrapping the response reader to enforce max_bytes.
+    // Read at most max_bytes + 1 bytes so an oversized body is never buffered whole.
     var transfer_buf: [4096]u8 = undefined;
-    var body_sink: std.Io.Writer.Allocating = .init(alloc);
     const body_reader = response.reader(&transfer_buf);
-
-    // Stream up to (max_bytes + 1) bytes; if we get more than max_bytes we
-    // know the response is too large.
-    const streamed = body_reader.streamRemaining(&body_sink.writer) catch |err| switch (err) {
-        error.ReadFailed => 0,
-        else => {
-            body_sink.deinit();
-            return err;
-        },
+    const body = body_reader.allocRemaining(alloc, .limited(max_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.ResponseTooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ReadFailed => try alloc.alloc(u8, 0),
     };
-
-    if (streamed > max_bytes) {
-        body_sink.deinit();
+    errdefer alloc.free(body);
+    if (body.len > max_bytes) {
+        alloc.free(body);
         return error.ResponseTooLarge;
     }
-
-    const body = try alloc.dupe(u8, body_sink.written());
-    body_sink.deinit();
 
     return .{
         .status = status,
@@ -464,7 +533,7 @@ fn handleFetch(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !mcp.
 
     const res = httpFetch(alloc, io, parsed.url, parsed.extra, parsed.max_bytes, .GET) catch |err| {
         return .{
-            .text = try std.fmt.allocPrint(alloc, "fetch error: {s}", .{@errorName(err)}),
+            .text = try fetchErrText(alloc, err),
             .is_error = true,
         };
     };
@@ -505,7 +574,7 @@ fn handleFetchRaw(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !m
 
     const res = httpFetch(alloc, io, parsed.url, parsed.extra, parsed.max_bytes, .GET) catch |err| {
         return .{
-            .text = try std.fmt.allocPrint(alloc, "fetch error: {s}", .{@errorName(err)}),
+            .text = try fetchErrText(alloc, err),
             .is_error = true,
         };
     };
@@ -541,7 +610,7 @@ fn handleFetchHead(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !
 
     const res = httpFetch(alloc, io, parsed.url, parsed.extra, default_max_bytes, .HEAD) catch |err| {
         return .{
-            .text = try std.fmt.allocPrint(alloc, "fetch error: {s}", .{@errorName(err)}),
+            .text = try fetchErrText(alloc, err),
             .is_error = true,
         };
     };
@@ -602,4 +671,23 @@ test "parseArgs max_bytes" {
     defer alloc.free(args.extra);
     try std.testing.expectEqual(@as(usize, 5), args.max_bytes);
     try std.testing.expectEqualStrings("http://example.com", args.url);
+}
+
+test "url policy blocks loopback, private and non-http URLs" {
+    const p: netpolicy.Policy = .{};
+    try std.testing.expect(netpolicy.check(p, "http://127.0.0.1/x") != null);
+    try std.testing.expect(netpolicy.check(p, "http://localhost:8080/") != null);
+    try std.testing.expect(netpolicy.check(p, "http://169.254.169.254/latest/meta-data") != null);
+    try std.testing.expect(netpolicy.check(p, "http://2130706433/") != null);
+    try std.testing.expect(netpolicy.check(p, "file:///etc/passwd") != null);
+    try std.testing.expect(netpolicy.check(p, "https://example.com/a") == null);
+}
+
+test "parseArgs clamps huge and non-finite max_bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"url\":\"https://example.com\",\"max_bytes\":1e30}", .{});
+    const parsed = try parseArgs(a, v);
+    try std.testing.expectEqual(hard_max_bytes, parsed.max_bytes);
 }

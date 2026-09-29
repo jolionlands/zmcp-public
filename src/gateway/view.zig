@@ -75,7 +75,7 @@ pub const View = struct {
             for (s.tools) |*t| {
                 v.total_before_slice += 1;
                 if (t.read_only) v.read_only_marked += 1;
-                if (profile.hiddenBy(slice, t.name, t.read_only)) |r| {
+                if (profile.hiddenByTool(slice, t.name, t.read_only, t.destructive)) |r| {
                     try hid.append(a, .{ .name = t.name, .server = s.name, .reason = r });
                     continue;
                 }
@@ -203,6 +203,27 @@ test "slice rules hide tools from lookup and record why" {
     try std.testing.expect(v.lookup("nope") == .missing);
     // A server outside the slice is simply missing.
     try std.testing.expect(v.lookup("docker_ps") == .missing);
+}
+
+test "no_destructive slice hides destructive tools and reports why" {
+    const alloc = std.testing.allocator;
+    var cat = try catalog.parse(alloc, test_catalog_text);
+    defer cat.deinit();
+    var v = try View.build(alloc, &cat, &.{ "git", "docker" }, .{ .no_destructive = true });
+    defer v.deinit();
+    for (v.exposed) |e| try std.testing.expect(!e.tool.destructive);
+    var seen = false;
+    for (v.hidden) |h| {
+        if (std.mem.eql(u8, h.name, "git_reset")) {
+            seen = true;
+            try std.testing.expectEqual(profile.Reason.no_destructive, h.reason);
+        }
+    }
+    try std.testing.expect(seen);
+    try std.testing.expect(v.lookup("docker_rm") == .hidden);
+    var all = try View.build(alloc, &cat, &.{ "git", "docker" }, .{});
+    defer all.deinit();
+    try std.testing.expect(all.exposed.len > v.exposed.len);
 }
 
 test "readonly slice keeps only marked tools; empty result is reported via counters" {

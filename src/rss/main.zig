@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const mcp = @import("mcp");
+const netpolicy = @import("netpolicy");
 
 const UA_PRODUCT = "zmcp-rss/0.1.0";
 const SUMMARY_LIMIT: usize = 400;
@@ -67,31 +68,117 @@ const FeedError = struct {
     message: []u8,
 };
 
+/// Upper bound for a feed body, compressed or decompressed.
+const max_body_bytes: usize = 8 * 1024 * 1024;
+const max_redirects: u8 = 5;
+/// Upper bound for any numeric limit argument.
+const hard_max_limit: i64 = 100_000;
+
+threadlocal var g_block_reason: []const u8 = "";
+
+/// URL policy: http(s) only; loopback/private/link-local/intranet hosts are
+/// refused (SSRF) unless ZMCP_RSS_ALLOW_PRIVATE=1. Re-checked at every redirect
+/// hop. DNS rebinding is not detected.
+fn urlBlocked(alloc: std.mem.Allocator, io: std.Io, url: []const u8) ?[]const u8 {
+    var allow_local = false;
+    if (mcp.envAlloc(alloc, io, "ZMCP_RSS_ALLOW_PRIVATE")) |v| {
+        defer alloc.free(v);
+        allow_local = std.mem.eql(u8, v, "1");
+    }
+    return netpolicy.check(.{ .allow_local = allow_local }, url);
+}
+
+/// Resolve a redirect Location against the current URL (absolute or root-relative only).
+fn resolveRedirect(alloc: std.mem.Allocator, cur: []const u8, loc: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, loc, "://") != null) return alloc.dupe(u8, loc);
+    if (loc.len > 0 and loc[0] == '/') {
+        const se = std.mem.indexOf(u8, cur, "://") orelse return error.InvalidRedirect;
+        const ae = std.mem.indexOfAnyPos(u8, cur, se + 3, "/?#") orelse cur.len;
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ cur[0..ae], loc });
+    }
+    return error.InvalidRedirect;
+}
+
 fn httpsGet(alloc: std.mem.Allocator, io: std.Io, url: []const u8) !HttpResp {
+    var cur: []const u8 = url;
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| alloc.free(o);
+    var hops: u8 = 0;
+    while (true) {
+        if (urlBlocked(alloc, io, cur)) |why| {
+            g_block_reason = why;
+            return error.BlockedByPolicy;
+        }
+        const res = try httpsGetHop(alloc, io, cur);
+        const code = res.status;
+        const loc = res.location orelse return .{ .status = res.status, .body = res.body };
+        defer alloc.free(loc);
+        if (code < 300 or code > 399 or code == 304) return .{ .status = res.status, .body = res.body };
+        alloc.free(res.body);
+        if (hops >= max_redirects) return error.TooManyRedirects;
+        hops += 1;
+        const next = try resolveRedirect(alloc, cur, loc);
+        if (owned) |o| alloc.free(o);
+        owned = next;
+        cur = next;
+    }
+}
+
+const HopResp = struct {
+    status: u16,
+    body: []u8,
+    location: ?[]u8 = null,
+};
+
+fn httpsGetHop(alloc: std.mem.Allocator, io: std.Io, url: []const u8) !HopResp {
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
     const ua_owned = try mcp.userAgent(alloc, io, UA_PRODUCT);
     defer alloc.free(ua_owned);
 
-    var resp_buf: std.Io.Writer.Allocating = .init(alloc);
-    defer resp_buf.deinit();
-    var decompress_buf: [128 * 1024]u8 = undefined;
-
-    const fetch_res = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &resp_buf.writer,
-        .method = .GET,
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{
         .extra_headers = &.{
-            .{ .name = "User-Agent", .value = ua_owned },
             .{ .name = "Accept", .value = "application/atom+xml, application/rss+xml, application/xml;q=0.9, */*;q=0.5" },
         },
-        .decompress_buffer = &decompress_buf,
+        .headers = .{ .user_agent = .{ .override = ua_owned } },
+        .redirect_behavior = .unhandled,
     });
+    defer req.deinit();
+    try req.sendBodiless();
 
-    return .{
-        .status = @intFromEnum(fetch_res.status),
-        .body = try alloc.dupe(u8, resp_buf.written()),
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    const status = @intFromEnum(response.head.status);
+    if (status >= 300 and status < 400) {
+        if (response.head.location) |l| {
+            return .{ .status = status, .body = try alloc.alloc(u8, 0), .location = try alloc.dupe(u8, l) };
+        }
+    }
+
+    // Bound both the wire body and (via the decompressor's output) the decoded body.
+    var transfer_buf: [4096]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    const body_reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
+    const body = body_reader.allocRemaining(alloc, .limited(max_body_bytes + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.ResponseTooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ReadFailed => return error.ReadFailed,
     };
+    if (body.len > max_body_bytes) {
+        alloc.free(body);
+        return error.ResponseTooLarge;
+    }
+    return .{ .status = status, .body = body };
+}
+
+fn fetchErrText(alloc: std.mem.Allocator, prefix: []const u8, err: anyerror) ![]u8 {
+    if (err == error.BlockedByPolicy) {
+        const why = g_block_reason[0 .. std.mem.indexOf(u8, g_block_reason, " (set ZMCP_BROWSER") orelse g_block_reason.len];
+        return std.fmt.allocPrint(alloc, "{s}: blocked: {s} (set ZMCP_RSS_ALLOW_PRIVATE=1 to allow private hosts)", .{ prefix, why });
+    }
+    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, @errorName(err) });
 }
 
 fn getStr(args: std.json.Value, key: []const u8) ?[]const u8 {
@@ -105,7 +192,7 @@ fn getInt(args: std.json.Value, key: []const u8, default: i64) i64 {
     const v = args.object.get(key) orelse return default;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (std.math.isFinite(f) and @abs(f) < 1e15) @as(i64, @intFromFloat(f)) else default,
         else => default,
     };
 }
@@ -409,10 +496,10 @@ fn freeErrors(alloc: std.mem.Allocator, errors: []FeedError) void {
 fn handleFetch(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !mcp.ToolResult {
     const url = getStr(args, "url") orelse return .{ .text = "url required", .is_error = true };
     const limit_raw = getInt(args, "limit", 25);
-    const limit: usize = @intCast(@max(limit_raw, 1));
+    const limit: usize = @intCast(std.math.clamp(limit_raw, 1, hard_max_limit));
 
     const resp = httpsGet(alloc, io, url) catch |err| {
-        return .{ .text = try std.fmt.allocPrint(alloc, "rss_fetch failed: {s}", .{@errorName(err)}), .is_error = true };
+        return .{ .text = try fetchErrText(alloc, "rss_fetch failed", err), .is_error = true };
     };
     if (resp.status != 200) return .{ .text = try std.fmt.allocPrint(alloc, "HTTP {d}", .{resp.status}), .is_error = true };
 
@@ -432,8 +519,8 @@ fn handleFetchMany(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !
     if (urls.items.len == 0) return .{ .text = "urls required", .is_error = true };
     const per_feed_raw = getInt(args, "limit_per_feed", 10);
     const total_raw = getInt(args, "total_limit", 50);
-    const per_feed: usize = @intCast(@max(per_feed_raw, 1));
-    const total: usize = @intCast(@max(total_raw, 1));
+    const per_feed: usize = @intCast(std.math.clamp(per_feed_raw, 1, hard_max_limit));
+    const total: usize = @intCast(std.math.clamp(total_raw, 1, hard_max_limit));
 
     var all_items: std.ArrayList(FeedItem) = .empty;
     var errors: std.ArrayList(FeedError) = .empty;
@@ -449,7 +536,7 @@ fn handleFetchMany(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !
         const resp = httpsGet(alloc, io, url_v.string) catch |err| {
             try errors.append(alloc, .{
                 .url = try alloc.dupe(u8, url_v.string),
-                .message = try alloc.dupe(u8, @errorName(err)),
+                .message = try fetchErrText(alloc, "error", err),
             });
             continue;
         };
@@ -477,4 +564,38 @@ fn handleFetchMany(alloc: std.mem.Allocator, io: std.Io, args: std.json.Value) !
     if (all_items.items.len > total) all_items.items.len = total;
     const body = try mergedToJson(alloc, all_items.items, errors.items);
     return .{ .text = try std.fmt.allocPrint(alloc, "{d} item(s) merged from {d} feed(s) ({d} errored):\n{s}", .{ all_items.items.len, urls.items.len, errors.items.len, body }) };
+}
+
+test "getInt: non-finite and huge floats fall back to default" {
+    const alloc = std.testing.allocator;
+    const vals = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 1e300 };
+    for (vals) |f| {
+        var mm: std.json.ObjectMap = .empty;
+        defer mm.deinit(alloc);
+        try mm.put(alloc, "limit", .{ .float = f });
+        try std.testing.expectEqual(@as(i64, 25), getInt(.{ .object = mm }, "limit", 25));
+    }
+    var mm: std.json.ObjectMap = .empty;
+    defer mm.deinit(alloc);
+    try mm.put(alloc, "limit", .{ .float = 7.9 });
+    try std.testing.expectEqual(@as(i64, 7), getInt(.{ .object = mm }, "limit", 25));
+}
+
+test "urlBlocked policy refuses private hosts and bad schemes" {
+    const p: netpolicy.Policy = .{};
+    try std.testing.expect(netpolicy.check(p, "http://127.0.0.1/feed") != null);
+    try std.testing.expect(netpolicy.check(p, "http://169.254.169.254/") != null);
+    try std.testing.expect(netpolicy.check(p, "file:///etc/passwd") != null);
+    try std.testing.expect(netpolicy.check(p, "https://example.com/feed.xml") == null);
+}
+
+test "resolveRedirect: absolute, root-relative, and rejected relative" {
+    const alloc = std.testing.allocator;
+    const a = try resolveRedirect(alloc, "https://a.example/x/y?q=1", "https://b.example/z");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("https://b.example/z", a);
+    const b = try resolveRedirect(alloc, "https://a.example/x/y?q=1", "/feed");
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("https://a.example/feed", b);
+    try std.testing.expectError(error.InvalidRedirect, resolveRedirect(alloc, "https://a.example/x", "rel"));
 }

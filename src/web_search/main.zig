@@ -97,12 +97,15 @@ fn requiredString(args: std.json.Value, key: []const u8) error{MissingArg}![]con
     };
 }
 
+/// Upper bound for any numeric count argument (guards casts and huge allocations).
+const hard_max_count: i64 = 1_000_000;
+
 fn optionalUint(args: std.json.Value, key: []const u8, default: usize) usize {
     if (args != .object) return default;
     const v = args.object.get(key) orelse return default;
     return switch (v) {
-        .integer => |i| if (i > 0) @intCast(i) else default,
-        .float => |f| if (f > 0) @intFromFloat(f) else default,
+        .integer => |i| if (i > 0) @intCast(@min(i, hard_max_count)) else default,
+        .float => |f| if (std.math.isFinite(f) and f >= 1) @as(usize, @intFromFloat(@min(f, @as(f64, @floatFromInt(hard_max_count))))) else default,
         else => default,
     };
 }
@@ -281,6 +284,7 @@ fn httpGet(
     io: std.Io,
     url: []const u8,
     extra_headers: []const std.http.Header,
+    follow_redirects: bool,
 ) ![]u8 {
     var client = std.http.Client{ .allocator = alloc, .io = io };
     defer client.deinit();
@@ -296,9 +300,11 @@ fn httpGet(
             .user_agent = .{ .override = ua },
         },
         .extra_headers = extra_headers,
+        .redirect_behavior = if (follow_redirects) null else .unhandled,
         .response_writer = &response_writer.writer,
     });
 
+    if (!follow_redirects and result.status.class() == .redirect) return error.UnexpectedRedirect;
     if (@intFromEnum(result.status) >= 400) {
         return error.HttpError;
     }
@@ -326,7 +332,7 @@ fn searchDdg(alloc: std.mem.Allocator, io: std.Io, query: []const u8, n: usize) 
         .{ .name = "Accept-Language", .value = "en-US,en;q=0.9" },
     };
 
-    const html = try httpGet(alloc, io, url, &extra_headers);
+    const html = try httpGet(alloc, io, url, &extra_headers, true);
     defer alloc.free(html);
 
     return parseDdgHtml(alloc, html, n);
@@ -500,7 +506,7 @@ fn searchSearxng(alloc: std.mem.Allocator, io: std.Io, query: []const u8, n: usi
         .{ .name = "Accept", .value = "application/json" },
     };
 
-    const body = try httpGet(alloc, io, url, &extra_headers);
+    const body = try httpGet(alloc, io, url, &extra_headers, true);
     defer alloc.free(body);
 
     return parseSearxngJson(alloc, body, n);
@@ -571,7 +577,7 @@ fn searchBrave(alloc: std.mem.Allocator, io: std.Io, query: []const u8, n: usize
         .{ .name = "Accept", .value = "application/json" },
     };
 
-    const body = try httpGet(alloc, io, url, &extra_headers);
+    const body = try httpGet(alloc, io, url, &extra_headers, false);
     defer alloc.free(body);
 
     return parseBraveJson(alloc, body, n);
@@ -654,9 +660,12 @@ fn searchTavily(alloc: std.mem.Allocator, io: std.Io, query: []const u8, n: usiz
         .payload = payload,
         .headers = .{ .user_agent = .{ .override = ua } },
         .extra_headers = &extra_headers,
+        .redirect_behavior = .unhandled,
         .response_writer = &response_writer.writer,
     });
 
+    // Never follow redirects from the API host: the request carries the key.
+    if (result.status.class() == .redirect) return error.UnexpectedRedirect;
     if (@intFromEnum(result.status) >= 400) return error.HttpError;
 
     const body = try alloc.dupe(u8, response_writer.written());
@@ -898,4 +907,32 @@ test "env lookup reads the real process environment (not an empty block)" {
     defer alloc.free(v);
     try std.testing.expect(v.len > 0);
     try std.testing.expect(getEnv(alloc, "ZMCP_SURELY_UNSET_ENV_VAR_12345") == null);
+}
+
+test "optionalUint: float NaN/inf/huge/negative fall back or clamp" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"n": 1e300}
+        , \\{"n": -1e300}
+        , \\{"n": 5.7}
+        , \\{"n": 9223372036854775807}
+    };
+    var parsed0 = try std.json.parseFromSlice(std.json.Value, alloc, cases[0], .{});
+    defer parsed0.deinit();
+    try std.testing.expectEqual(@as(usize, 1_000_000), optionalUint(parsed0.value, "n", 7));
+    var parsed1 = try std.json.parseFromSlice(std.json.Value, alloc, cases[1], .{});
+    defer parsed1.deinit();
+    try std.testing.expectEqual(@as(usize, 7), optionalUint(parsed1.value, "n", 7));
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, alloc, cases[2], .{});
+    defer parsed2.deinit();
+    try std.testing.expectEqual(@as(usize, 5), optionalUint(parsed2.value, "n", 7));
+    var parsed3 = try std.json.parseFromSlice(std.json.Value, alloc, cases[3], .{});
+    defer parsed3.deinit();
+    try std.testing.expectEqual(@as(usize, 1_000_000), optionalUint(parsed3.value, "n", 7));
+    var obj: std.json.Value = .{ .float = std.math.nan(f64) };
+    var m: std.json.ObjectMap = .empty;
+    defer m.deinit(alloc);
+    try m.put(alloc, "n", obj);
+    obj = .{ .object = m };
+    try std.testing.expectEqual(@as(usize, 7), optionalUint(obj, "n", 7));
 }

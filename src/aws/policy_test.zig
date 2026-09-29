@@ -32,46 +32,46 @@ fn expectDenied(svc: []const u8, op: []const u8) !void {
 
 test "read verbs are read" {
     const rows = [_][2][]const u8{
-        .{ "ec2", "describe-instances" },     .{ "iam", "list-users" },           .{ "iam", "get-role" },
-        .{ "dynamodb", "batch-get-item" },    .{ "s3api", "head-object" },        .{ "cloudtrail", "lookup-events" },
-        .{ "s3api", "list-objects-v2" },      .{ "resourcegroupstaggingapi", "get-resources" },
-        .{ "kendra", "search-anything" },     .{ "codebuild", "batch-get-builds" },
-        .{ "sts", "get-caller-identity" },    .{ "s3", "ls" },
-        .{ "secretsmanager", "list-secrets" }, .{ "secretsmanager", "describe-secret" },
-        .{ "secretsmanager", "get-random-password" }, .{ "iam", "get-account-password-policy" },
-        .{ "ssm", "get-parameter" },          .{ "lambda", "get-function" },
+        .{ "ec2", "describe-instances" },            .{ "iam", "list-users" },                         .{ "iam", "get-role" },
+        .{ "dynamodb", "batch-get-item" },           .{ "s3api", "head-object" },                      .{ "cloudtrail", "lookup-events" },
+        .{ "s3api", "list-objects-v2" },             .{ "resourcegroupstaggingapi", "get-resources" }, .{ "kendra", "search-anything" },
+        .{ "codebuild", "batch-get-builds" },        .{ "sts", "get-caller-identity" },                .{ "s3", "ls" },
+        .{ "secretsmanager", "list-secrets" },       .{ "secretsmanager", "describe-secret" },         .{ "secretsmanager", "get-random-password" },
+        .{ "iam", "get-account-password-policy" },   .{ "ssm", "get-parameter" },                      .{ "lambda", "get-function" },
         .{ "lambda", "get-function-configuration" }, .{ "kms", "get-public-key" },
         .{ "iam", "list-service-specific-credentials" }, // list-* metadata, not secrets
-        .{ "dynamodb", "query" },             .{ "dynamodb", "scan" },
-        .{ "logs", "tail" },                  .{ "logs", "filter-log-events" },
-        .{ "iam", "simulate-principal-policy" }, .{ "cloudformation", "validate-template" },
+        .{ "dynamodb", "query" },
+        .{ "dynamodb", "scan" },
+        .{ "logs", "tail" },
+        .{ "logs", "filter-log-events" },
+        .{ "iam", "simulate-principal-policy" },
+        .{ "cloudformation", "validate-template" },
     };
     for (rows) |r| try expectClass(r[0], r[1], .read);
 }
 
 test "non-read verbs are writes; destructive verbs escalate" {
     const writes = [_][2][]const u8{
-        .{ "ec2", "run-instances" },   .{ "ec2", "start-instances" },  .{ "ec2", "create-tags" },
-        .{ "s3api", "put-object" },    .{ "s3api", "create-bucket" },  .{ "s3", "cp" },
-        .{ "s3", "mb" },               .{ "sqs", "send-message" },     .{ "sqs", "receive-message" },
-        .{ "sns", "publish" },         .{ "logs", "start-query" },     .{ "lambda", "update-function-code" },
-        .{ "dynamodb", "put-item" },   .{ "foo", "totally-unknown-op" }, .{ "s3", "unknown-subcommand" },
+        .{ "ec2", "run-instances" },        .{ "ec2", "start-instances" },          .{ "ec2", "create-tags" },
+        .{ "s3api", "put-object" },         .{ "s3api", "create-bucket" },          .{ "s3", "cp" },
+        .{ "s3", "mb" },                    .{ "sqs", "send-message" },             .{ "sqs", "receive-message" },
+        .{ "sns", "publish" },              .{ "logs", "start-query" },             .{ "lambda", "update-function-code" },
+        .{ "dynamodb", "put-item" },        .{ "foo", "totally-unknown-op" },       .{ "s3", "unknown-subcommand" },
         .{ "s3api", "put-bucket-tagging" }, .{ "athena", "start-query-execution" },
     };
     for (writes) |r| try expectClass(r[0], r[1], .write);
 
     const destructive = [_][2][]const u8{
-        .{ "ec2", "terminate-instances" }, .{ "ec2", "stop-instances" },      .{ "ec2", "reboot-instances" },
-        .{ "s3api", "delete-object" },     .{ "s3api", "delete-bucket" },     .{ "s3", "rm" },
-        .{ "s3", "rb" },                   .{ "s3", "mv" },                   .{ "s3", "sync" },
-        .{ "ec2", "deregister-image" },    .{ "ec2", "detach-volume" },       .{ "ec2", "revoke-security-group-ingress" },
-        .{ "ec2", "disable-vpc-classic-link" }, .{ "iam", "update-assume-role-policy" }, .{ "iam", "attach-role-policy" },
-        .{ "iam", "create-role" },         .{ "iam", "put-role-policy" },     .{ "iam", "delete-user" },
-        .{ "s3api", "put-bucket-policy" }, .{ "sns", "remove-permission" },   .{ "lambda", "invoke" },
-        .{ "lambda", "delete-function" },  .{ "ssm", "send-command" },        .{ "ssm", "start-session" },
-        .{ "ecs", "execute-command" },     .{ "rds-data", "execute-statement" }, .{ "kms", "schedule-key-deletion" },
-        .{ "sqs", "purge-queue" },         .{ "ec2", "cancel-spot-instance-requests" },
-        .{ "organizations", "put-resource-policy" },
+        .{ "ec2", "terminate-instances" },      .{ "ec2", "stop-instances" },                .{ "ec2", "reboot-instances" },
+        .{ "s3api", "delete-object" },          .{ "s3api", "delete-bucket" },               .{ "s3", "rm" },
+        .{ "s3", "rb" },                        .{ "s3", "mv" },                             .{ "s3", "sync" },
+        .{ "ec2", "deregister-image" },         .{ "ec2", "detach-volume" },                 .{ "ec2", "revoke-security-group-ingress" },
+        .{ "ec2", "disable-vpc-classic-link" }, .{ "iam", "update-assume-role-policy" },     .{ "iam", "attach-role-policy" },
+        .{ "iam", "create-role" },              .{ "iam", "put-role-policy" },               .{ "iam", "delete-user" },
+        .{ "s3api", "put-bucket-policy" },      .{ "sns", "remove-permission" },             .{ "lambda", "invoke" },
+        .{ "lambda", "delete-function" },       .{ "ssm", "send-command" },                  .{ "ssm", "start-session" },
+        .{ "ecs", "execute-command" },          .{ "rds-data", "execute-statement" },        .{ "kms", "schedule-key-deletion" },
+        .{ "sqs", "purge-queue" },              .{ "ec2", "cancel-spot-instance-requests" }, .{ "organizations", "put-resource-policy" },
     };
     for (destructive) |r| try expectClass(r[0], r[1], .destructive);
 }
@@ -289,17 +289,22 @@ test "denied flags: exact, abbreviated, cased, snake and camel forms" {
     var h = Harness.init();
     defer h.deinit();
     const keys = [_][]const u8{
-        "endpoint-url", "endpoint_url", "endpointUrl", "EndpointUrl", "endpoint", "endpoint-ur", "e",
-        "no-verify-ssl", "noVerifySsl", "no-verify", "no",
-        "ca-bundle", "ca", "cabundle_", // last is not an abbreviation and simply unknown; handled below
-        "debug", "deb", "d",
-        "output", "out", "o",
-        "query", "que", "q",
-        "no-paginate", "max-items", "max", "m",
-        "no-sign-request", "color", "col", "version", "help", "h", "region", "reg", "r",
-        "profile", "prof", "pr", "p", "v2-debug", "generate-cli-skeleton", "gen",
-        "cli-input-json", "cli-input-yaml", "cli-binary-format", "cli-read-timeout", "cli-connect-timeout", "cli-auto-prompt", "cli-anything",
-        "no-cli-pager", "no-cli",
+        "endpoint-url",  "endpoint_url", "endpointUrl", "EndpointUrl", "endpoint", "endpoint-ur", "e",
+        "no-verify-ssl", "noVerifySsl",  "no-verify",   "no",
+        "ca-bundle",             "ca",                "cabundle_", // last is not an abbreviation and simply unknown; handled below
+        "debug",                 "deb",               "d",
+        "output",                "out",               "o",
+        "query",                 "que",               "q",
+        "no-paginate",           "max-items",         "max",
+        "m",                     "no-sign-request",   "color",
+        "col",                   "version",           "help",
+        "h",                     "region",            "reg",
+        "r",                     "profile",           "prof",
+        "pr",                    "p",                 "v2-debug",
+        "generate-cli-skeleton", "gen",               "cli-input-json",
+        "cli-input-yaml",        "cli-binary-format", "cli-read-timeout",
+        "cli-connect-timeout",   "cli-auto-prompt",   "cli-anything",
+        "no-cli-pager",          "no-cli",
     };
     for (keys) |k| {
         if (std.mem.eql(u8, k, "cabundle_")) continue;
@@ -340,12 +345,12 @@ test "file://, fileb://, http(s)://, expansion and control chars in values" {
     var h = Harness.init();
     defer h.deinit();
     const bad_vals = [_][]const u8{
-        "file:///etc/passwd",      "FILE:///etc/passwd",   "fileb:///etc/passwd",
-        " file://x",               "Name=file://x",         "prefix-file://x",
-        "\\\\nfile://x",           "http://169.254.169.254/latest/meta-data",
-        "https://evil.example/x",  "HTTPS://evil/x",       "  http://x",
-        "$(id)",                   "a`id`b",               "x\\u0000y",
-        "x\\u0007y",               "x\\u007fy",
+        "file:///etc/passwd", "FILE:///etc/passwd",                      "fileb:///etc/passwd",
+        " file://x",          "Name=file://x",                           "prefix-file://x",
+        "\\\\nfile://x",      "http://169.254.169.254/latest/meta-data", "https://evil.example/x",
+        "HTTPS://evil/x",     "  http://x",                              "$(id)",
+        "a`id`b",             "x\\u0000y",                               "x\\u0007y",
+        "x\\u007fy",
     };
     for (bad_vals) |v| {
         const js = try std.fmt.allocPrint(h.arena.allocator(), "{{\"policy-document\":\"{s}\"}}", .{v});
@@ -542,9 +547,9 @@ test "defaults refuse writes end-to-end via build (read-only server)" {
     var h = Harness.init();
     defer h.deinit();
     const writes = [_][2][]const u8{
-        .{ "ec2", "run-instances" },     .{ "s3api", "put-object" },   .{ "iam", "create-role" },
+        .{ "ec2", "run-instances" },       .{ "s3api", "put-object" },    .{ "iam", "create-role" },
         .{ "ec2", "terminate-instances" }, .{ "s3api", "delete-bucket" }, .{ "lambda", "invoke" },
-        .{ "ssm", "send-command" },       .{ "sns", "publish" },        .{ "unknown", "frobnicate" },
+        .{ "ssm", "send-command" },        .{ "sns", "publish" },         .{ "unknown", "frobnicate" },
     };
     for (writes) |w| try expectErr(try h.build(w[0], w[1], null), "refused");
     const reads = [_][2][]const u8{
@@ -554,4 +559,33 @@ test "defaults refuse writes end-to-end via build (read-only server)" {
         .ok => {},
         .err => return error.TestUnexpectedResult,
     };
+}
+
+test "secret-valued inputs are refused, not passed on argv" {
+    var h = Harness.init();
+    defer h.deinit();
+    h.cfg.allow_write = true;
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "secretsmanager", "put-secret-value", "{\"secret-id\":\"s\",\"secret-string\":\"hunter2\"}" },
+        .{ "secretsmanager", "put-secret-value", "{\"secret-id\":\"s\",\"SecretString\":\"hunter2\"}" },
+        .{ "secretsmanager", "put-secret-value", "{\"secret-id\":\"s\",\"secret_binary\":\"aGk=\"}" },
+        .{ "secretsmanager", "create-secret", "{\"name\":\"s\",\"secret-str\":\"hunter2\"}" },
+        .{ "rds", "modify-db-instance", "{\"db-instance-identifier\":\"d\",\"master-user-password\":\"pw\"}" },
+        .{ "redshift", "modify-cluster", "{\"cluster-identifier\":\"c\",\"master-user-password\":\"pw\"}" },
+        .{ "rds", "create-db-instance", "{\"db-instance-identifier\":\"d\",\"master-user-pass\":\"pw\"}" },
+        .{ "kms", "encrypt", "{\"key-id\":\"k\",\"plaintext\":\"aGk=\"}" },
+        .{ "ssm", "put-parameter", "{\"name\":\"/a\",\"value\":\"v\",\"type\":\"SecureString\"}" },
+    };
+    for (cases) |c| {
+        const b = try h.build(c[0], c[1], c[2]);
+        try expectErr(b, "command line");
+        // the secret text must not appear anywhere in the message either
+        switch (b) {
+            .err => |m| try testing.expect(std.mem.indexOf(u8, m, "hunter2") == null),
+            .ok => unreachable,
+        }
+    }
+    // benign flags with similar names still work
+    try testing.expect(argvContains(try h.build("secretsmanager", "get-random-password", "{\"password-length\":20}"), "--password-length=20"));
+    try testing.expect(argvContains(try h.build("secretsmanager", "put-secret-value", "{\"secret-id\":\"s\"}"), "--secret-id=s"));
 }

@@ -267,8 +267,11 @@ fn httpGet(alloc: std.mem.Allocator, io: std.Io, url: []const u8, api_key: ?[]co
         .location = .{ .url = url },
         .method = .GET,
         .extra_headers = headers.items,
+        // Never follow redirects: the request may carry the API key.
+        .redirect_behavior = .unhandled,
         .response_writer = &response_writer.writer,
     });
+    if (result.status.class() == .redirect) return error.UnexpectedRedirect;
 
     return .{
         .status = @intFromEnum(result.status),

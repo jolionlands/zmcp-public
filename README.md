@@ -7,8 +7,10 @@ Code, Codex, Cursor and others). There is no Node runtime, no V8 and no JIT:
 an idle server uses about 1 to 3 MB of memory and a typical `tools/list`
 is a few kilobytes.
 
-Read-only by default: anything that writes, executes code or deletes is
-refused until you set an explicit `ZMCP_<NAME>_ALLOW_*` variable.
+Most servers that write, run code or delete refuse until you set an explicit
+`ZMCP_<NAME>_ALLOW_*` variable, but this is not uniform across all servers yet.
+Check the server's row below and its tool descriptions before exposing it to an
+untrusted model, and see [SECURITY.md](SECURITY.md) for the known gaps.
 
 ## Contents
 
@@ -59,11 +61,11 @@ unless the description says "needs".
 |---|---|
 | `zmcp-web-search` | Web search via Brave (`BRAVE_API_KEY`), Tavily (`TAVILY_API_KEY`) or SearXNG (`SEARXNG_URL`). DuckDuckGo HTML scraping is off unless `ZMCP_WEB_SEARCH_ALLOW_DDG_SCRAPE=1` (may violate its terms) |
 | `zmcp-websearch-apis` | Exa, Tavily and Firecrawl in one binary; a provider's tools appear only when its API key is set. Not run against the live APIs |
-| `zmcp-fetch` | HTTP fetch with content-type-aware extraction |
+| `zmcp-fetch` | HTTP fetch with content-type-aware extraction. Refuses non-http(s) URLs and loopback, private and link-local hosts (re-checked on every redirect) unless `ZMCP_FETCH_ALLOW_PRIVATE=1`; not DNS-rebinding safe. `max_bytes` is capped at 64 MiB |
 | `zmcp-browser` | Chrome DevTools Protocol automation over a hand-written WebSocket client. See [zmcp-browser](#zmcp-browser) |
 | `zmcp-context7` | Library id resolution and documentation lookup via Context7 |
 | `zmcp-mslearn` | Microsoft Learn search and fetch through Microsoft's hosted MCP endpoint (no key). Untested against the live endpoint |
-| `zmcp-zig-docs` | Zig tool wrappers plus stdlib symbol and file lookup (`ZIG_BIN`, default `zig` on `PATH`) |
+| `zmcp-zig-docs` | Zig tool wrappers plus stdlib symbol and file lookup (`ZIG_BIN`, default `zig` on `PATH`). `zig_build` and `zig_test_file` execute Zig code and need `ZMCP_ZIG_DOCS_ALLOW_RUN=1` |
 | `zmcp-zig-packages` | Zig package search over GitHub |
 | `zmcp-package-registry` | npm, PyPI and crates.io queries |
 | `zmcp-compiler-explorer` | godbolt.org: compile, run, diagnostics, optimization analysis, share URLs |
@@ -99,22 +101,22 @@ unless the description says "needs".
 | `zmcp-sqlite` | Per-call query, exec and schema inspection via the local `sqlite3` CLI |
 | `zmcp-duckdb` | DuckDB CLI: read-only SQL over databases or csv/parquet/json files, schema; writes need `ZMCP_DUCKDB_ALLOW_WRITE=1` |
 | `zmcp-redis` | Native RESP2 client (`REDIS_URL`): get, list (SCAN), ttl, type, hgetall. set/delete need `ZMCP_REDIS_ALLOW_WRITE=1`. Plain TCP only, no TLS |
-| `zmcp-docker` | Docker CLI: ps, images, logs, inspect, stats, compose. Start/stop/restart need `ZMCP_DOCKER_ALLOW_WRITE=1` |
-| `zmcp-kubernetes` | kubectl: get, describe, logs, top, events, rollout status, context. Apply/delete/scale/restart need `ZMCP_KUBERNETES_ALLOW_WRITE=1`; no exec or port-forward; Secret values redacted |
+| `zmcp-docker` | Docker CLI: ps, images, logs, inspect, stats, compose. Start/stop/restart need `ZMCP_DOCKER_ALLOW_WRITE=1`. `inspect` redacts secret-named `Env` entries and URL passwords |
+| `zmcp-kubernetes` | kubectl: get, describe, logs, top, events, rollout status, context. Apply/delete/scale/restart need `ZMCP_KUBERNETES_ALLOW_WRITE=1`; no exec or port-forward. `describe` of Secrets is refused; values are redacted in `get`, and scrubbed heuristically in `describe` and `logs` (name-based, not a guarantee) |
 | `zmcp-aws` | AWS CLI behind an allowlist of read operations; secret-returning calls blocked, output redacted. Writes need `ZMCP_AWS_ALLOW_WRITE=1`, destructive calls also `ZMCP_AWS_ALLOW_DESTRUCTIVE=1`. Tested with fakes and awscli v1 only |
 
 ### Files, memory and productivity
 
 | Server | Description |
 |---|---|
-| `zmcp-fs` | Filesystem operations beyond a host's built-ins |
+| `zmcp-fs` | Filesystem operations beyond a host's built-ins. Mutating tools refuse `..` and absolute paths outside the working directory unless `allow_outside=true` or `ZMCP_FS_ALLOW_OUTSIDE=1`; symlinks are not resolved |
 | `zmcp-pdf` | Pure-Zig PDF text extraction: info, page text, search. Encrypted and scanned PDFs are reported, not read. Confined to `ZMCP_PDF_ROOT` |
 | `zmcp-memory` | Knowledge-graph memory (entities, relations, observations), JSONL-compatible with the reference server |
 | `zmcp-hippo` | Wrapper over the `hippo` CLI (graph and temporal vector memory). Set `HIPPO_BIN` / `HIPPO_DIR`; admin and daemon commands are not exposed |
 | `zmcp-sequentialthinking` | Branching, revision-aware sequential-thinking state machine (port of the reference server) |
 | `zmcp-todo` | Per-project todo scratchpad |
 | `zmcp-wiki` | Wiki search, note read, backlinks and tag views |
-| `zmcp-tickets` | Ticket, sprint, verify and swarm tools |
+| `zmcp-tickets` | Ticket, sprint, verify and swarm tools. `verify_run` executes a shell command and needs `ZMCP_TICKETS_ALLOW_EXEC=1` |
 | `zmcp-notion` | Search, pages, blocks as text, data-source queries, comments, users. Writes need `ZMCP_NOTION_ALLOW_WRITE=1` (`NOTION_TOKEN`). Not run against the live API |
 
 ### Media, creative and AI
@@ -181,6 +183,10 @@ its tool descriptions and the tables above):
 | `ZMCP_CONTACT` | every server that calls an HTTP API | Email or URL appended to the User-Agent as `; contact: ...`, so API operators can reach you. Recommended for `zmcp-package-registry` (crates.io policy) and `zmcp-arxiv` |
 | `REDDIT_USERNAME` | `zmcp-social` | Reddit username for the User-Agent `linux:zmcp-social:0.1.0 (by /u/NAME)`. Unset means anonymous requests, which Reddit may throttle or block |
 | `ZMCP_LOCAL_TZ` | `zmcp-time` | IANA zone used when a call gives no timezone (default `UTC`) |
+| `ZMCP_NO_DESTRUCTIVE` | every server | `1` hides and refuses tools marked destructive, like `ZMCP_READONLY` does for non-read-only tools. Gateway profiles accept `"no_destructive": true` |
+| `ZMCP_HTTP_TOKEN`, `ZMCP_HTTP_INSECURE` | HTTP hosting (`ZMCP_HTTP`) | A set-but-empty token stops startup. A non-loopback bind needs a token unless `ZMCP_HTTP_INSECURE=1` |
+| `ZMCP_FETCH_ALLOW_PRIVATE`, `ZMCP_RSS_ALLOW_PRIVATE` | `zmcp-fetch`, `zmcp-rss` | `1` allows loopback, private and link-local hosts (blocked by default) |
+| `ZMCP_FS_ALLOW_OUTSIDE`, `ZMCP_MD_ROOT`, `ZMCP_DIFF_ROOT` | `zmcp-fs`, `zmcp-markdown-render`, `zmcp-diff-render` | Path confinement: cwd by default; `ZMCP_FS_ALLOW_OUTSIDE=1` lifts it for `fs`, the others name the allowed root |
 | `ZMCP_WEB_SEARCH_ALLOW_DDG_SCRAPE` | `zmcp-web-search` | `1` allows the DuckDuckGo HTML scraping backend. Off by default; with no backend configured the tool returns an error explaining the options |
 
 Every HTTP-calling server identifies itself honestly, for example
@@ -262,9 +268,16 @@ If two servers in the slice expose the same tool name (for example
 Found next to the gateway executable (`ZMCP_GATEWAY_BIN_DIR` overrides that
 directory), else on `PATH`. Argv-only: a validated server name
 (`[a-z0-9_-]+`) becomes `zmcp-<name>`; no shell, no user string on a command
-line. Children inherit the environment (so `ZMCP_DOCKER_ALLOW_WRITE`, API keys,
-`ZMCP_MAX_RESULT_BYTES` work) minus the gateway-only variables `ZMCP_HTTP*`,
-`ZMCP_GATEWAY_*` and `ZMCP_TOOL_MODE`, so they stay on stdio in full mode.
+line. Each child gets a scoped environment: a base allowlist (`PATH`, `HOME`,
+temp dirs, locale, proxy and CA variables, `ZMCP_MAX_RESULT_BYTES`,
+`ZMCP_CONTACT`), every `ZMCP_<SERVER>_*` variable for that server, and the
+credentials that server actually reads (for example `GITHUB_TOKEN` only for
+`github`). A narrow server therefore never sees your other API keys or another
+server's `ZMCP_*_ALLOW_*` write flags. Add extras with `ZMCP_GATEWAY_PASS_ENV`
+(comma-separated names, trailing `*` allowed), or restore the old
+inherit-everything behaviour with `ZMCP_GATEWAY_INHERIT_ENV=1`. Gateway-only
+variables (`ZMCP_HTTP*`, `ZMCP_GATEWAY_*`, `ZMCP_TOOL_MODE`) are never passed on,
+so children stay on stdio in full mode.
 Tool arguments and environment values are never logged. A child that crashes
 or times out is killed and marked dead; the call returns an `isError` result
 and the next call respawns it (a request that could not even be written is
@@ -283,6 +296,8 @@ exit by themselves if the gateway dies, since their stdin closes.
 | `ZMCP_GATEWAY_IDLE_SECS` | 300 | Reap a child idle this long (0 = never) |
 | `ZMCP_GATEWAY_CALL_TIMEOUT_SECS` | 120 | Per-call timeout; the child is killed on expiry |
 | `ZMCP_GATEWAY_MAX_CHILDREN` | 8 | Live children cap; the least recently used idle one is reaped |
+| `ZMCP_GATEWAY_PASS_ENV` | none | Extra variable names (or `PREFIX_*`) to pass to every child |
+| `ZMCP_GATEWAY_INHERIT_ENV` | off | `1` passes the whole environment to children (old behaviour) |
 
 ### Catalog
 

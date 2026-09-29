@@ -73,17 +73,26 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
 
+    // URL/SSRF policy shared by zmcp-browser (as a sibling file) and zmcp-fetch.
+    const netpolicy_mod = b.createModule(.{
+        .root_source_file = b.path("src/browser/policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     inline for (tools) |t| {
+        const root_mod = b.createModule(.{
+            .root_source_file = b.path(t.src),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mcp", .module = mcp_mod },
+            },
+        });
+        if (comptime std.mem.eql(u8, t.name, "fetch") or std.mem.eql(u8, t.name, "rss")) root_mod.addImport("netpolicy", netpolicy_mod);
         const exe = b.addExecutable(.{
             .name = t.binary,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(t.src),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "mcp", .module = mcp_mod },
-                },
-            }),
+            .root_module = root_mod,
         });
         b.installArtifact(exe);
 
