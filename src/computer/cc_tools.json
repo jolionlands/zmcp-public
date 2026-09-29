@@ -1,0 +1,338 @@
+[
+ {
+  "name": "click_screen",
+  "description": "Click at the specified screen coordinates.",
+  "inputSchema": {
+   "properties": {
+    "x": {
+     "title": "X",
+     "type": "integer"
+    },
+    "y": {
+     "title": "Y",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "x",
+    "y"
+   ],
+   "title": "click_screenArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "get_screen_size",
+  "description": "Get the current screen resolution.",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_screen_sizeArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "type_text",
+  "description": "Type the specified text at the current cursor position.",
+  "inputSchema": {
+   "properties": {
+    "text": {
+     "title": "Text",
+     "type": "string"
+    }
+   },
+   "required": [
+    "text"
+   ],
+   "title": "type_textArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "take_screenshot",
+  "description": "\n    Get screenshot Image as MCP Image object. If no title pattern is provided, get screenshot of entire screen and all text on the screen.\n\n    Args:\n        title_pattern: Pattern to match window title, if None, take screenshot of entire screen\n        use_regex: If True, treat the pattern as a regex, otherwise best match with fuzzy matching\n        threshold: Minimum score (0-100) required for a fuzzy match\n        scale_percent_for_ocr: Percentage to scale the image down before processing, you wont need this most of the time unless your pc is extremely old or slow\n        save_to_downloads: If True, save the screenshot to the downloads directory and return the absolute path\n        use_wgc: If True, use Windows Graphics Capture API for window capture (recommended for GPU-accelerated windows)\n\n    Returns:\n        Returns a single screenshot as MCP Image object. \"content type image not supported\" means preview isnt supported but Image object is there and returned successfully.\n    ",
+  "inputSchema": {
+   "properties": {
+    "title_pattern": {
+     "default": null,
+     "title": "Title Pattern",
+     "type": "string"
+    },
+    "use_regex": {
+     "default": false,
+     "title": "Use Regex",
+     "type": "boolean"
+    },
+    "threshold": {
+     "default": 10,
+     "title": "Threshold",
+     "type": "integer"
+    },
+    "scale_percent_for_ocr": {
+     "default": null,
+     "title": "Scale Percent For Ocr",
+     "type": "integer"
+    },
+    "save_to_downloads": {
+     "default": false,
+     "title": "Save To Downloads",
+     "type": "boolean"
+    },
+    "use_wgc": {
+     "default": false,
+     "title": "Use Wgc",
+     "type": "boolean"
+    }
+   },
+   "title": "take_screenshotArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "take_screenshot_with_ocr",
+  "description": "\n    Get OCR text from screenshot with absolute coordinates as JSON string of List[Tuple[List[List[int]], str, float]] (returned after adding the window offset from true (0, 0) of screen to the OCR coordinates, so clicking is on-point. Recommended to click in the middle of OCR Box) and using confidence from window with the specified title pattern. If no title pattern is provided, get screenshot of entire screen and all text on the screen. Know that OCR takes around 20 seconds on an mid-spec pc at 1080p resolution.\n\n    Args:\n        title_pattern: Pattern to match window title, if None, take screenshot of entire screen\n        use_regex: If True, treat the pattern as a regex, otherwise best match with fuzzy matching\n        threshold: Minimum score (0-100) required for a fuzzy match\n        scale_percent_for_ocr: Percentage to scale the image down before processing, you wont need this most of the time unless your pc is extremely old or slow\n        save_to_downloads: If True, save the screenshot to the downloads directory and return the absolute path\n\n    Returns:\n        Returns a list of UI elements as List[Tuple[List[List[int]], str, float]] where each tuple is [[4 corners of box], text, confidence], \"content type image not supported\" means preview isnt supported but Image object is there.\n    ",
+  "inputSchema": {
+   "properties": {
+    "title_pattern": {
+     "default": null,
+     "title": "Title Pattern",
+     "type": "string"
+    },
+    "use_regex": {
+     "default": false,
+     "title": "Use Regex",
+     "type": "boolean"
+    },
+    "threshold": {
+     "default": 10,
+     "title": "Threshold",
+     "type": "integer"
+    },
+    "scale_percent_for_ocr": {
+     "default": null,
+     "title": "Scale Percent For Ocr",
+     "type": "integer"
+    },
+    "save_to_downloads": {
+     "default": false,
+     "title": "Save To Downloads",
+     "type": "boolean"
+    }
+   },
+   "title": "take_screenshot_with_ocrArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "move_mouse",
+  "description": "Move the mouse to the specified screen coordinates.",
+  "inputSchema": {
+   "properties": {
+    "x": {
+     "title": "X",
+     "type": "integer"
+    },
+    "y": {
+     "title": "Y",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "x",
+    "y"
+   ],
+   "title": "move_mouseArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "mouse_down",
+  "description": "Hold down a mouse button ('left', 'right', 'middle').",
+  "inputSchema": {
+   "properties": {
+    "button": {
+     "default": "left",
+     "title": "Button",
+     "type": "string"
+    }
+   },
+   "title": "mouse_downArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "mouse_up",
+  "description": "Release a mouse button ('left', 'right', 'middle').",
+  "inputSchema": {
+   "properties": {
+    "button": {
+     "default": "left",
+     "title": "Button",
+     "type": "string"
+    }
+   },
+   "title": "mouse_upArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "drag_mouse",
+  "description": "\n    Drag the mouse from one position to another.\n\n    Args:\n        from_x: Starting X coordinate\n        from_y: Starting Y coordinate\n        to_x: Ending X coordinate\n        to_y: Ending Y coordinate\n        duration: Duration of the drag in seconds (default: 0.5)\n\n    Returns:\n        Success or error message\n    ",
+  "inputSchema": {
+   "properties": {
+    "from_x": {
+     "title": "From X",
+     "type": "integer"
+    },
+    "from_y": {
+     "title": "From Y",
+     "type": "integer"
+    },
+    "to_x": {
+     "title": "To X",
+     "type": "integer"
+    },
+    "to_y": {
+     "title": "To Y",
+     "type": "integer"
+    },
+    "duration": {
+     "default": 0.5,
+     "title": "Duration",
+     "type": "number"
+    }
+   },
+   "required": [
+    "from_x",
+    "from_y",
+    "to_x",
+    "to_y"
+   ],
+   "title": "drag_mouseArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "key_down",
+  "description": "Hold down a specific keyboard key until released.",
+  "inputSchema": {
+   "properties": {
+    "key": {
+     "title": "Key",
+     "type": "string"
+    }
+   },
+   "required": [
+    "key"
+   ],
+   "title": "key_downArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "key_up",
+  "description": "Release a specific keyboard key.",
+  "inputSchema": {
+   "properties": {
+    "key": {
+     "title": "Key",
+     "type": "string"
+    }
+   },
+   "required": [
+    "key"
+   ],
+   "title": "key_upArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "press_keys",
+  "description": "\n    Press keyboard keys.\n\n    Args:\n        keys:\n            - Single key as string (e.g., \"enter\")\n            - Sequence of keys as list (e.g., [\"a\", \"b\", \"c\"])\n            - Key combinations as nested list (e.g., [[\"ctrl\", \"c\"], [\"alt\", \"tab\"]])\n\n    Examples:\n        press_keys(\"enter\")\n        press_keys([\"a\", \"b\", \"c\"])\n        press_keys([[\"ctrl\", \"c\"], [\"alt\", \"tab\"]])\n    ",
+  "inputSchema": {
+   "properties": {
+    "keys": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "items": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "items": {
+           "type": "string"
+          },
+          "type": "array"
+         }
+        ]
+       },
+       "type": "array"
+      }
+     ],
+     "title": "Keys"
+    }
+   },
+   "required": [
+    "keys"
+   ],
+   "title": "press_keysArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "list_windows",
+  "description": "List all open windows on the system.",
+  "inputSchema": {
+   "properties": {},
+   "title": "list_windowsArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "wait_milliseconds",
+  "description": "\n    Wait for a specified number of milliseconds.\n    \n    Args:\n        milliseconds: Number of milliseconds to wait\n        \n    Returns:\n        Success message after waiting\n    ",
+  "inputSchema": {
+   "properties": {
+    "milliseconds": {
+     "title": "Milliseconds",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "milliseconds"
+   ],
+   "title": "wait_millisecondsArguments",
+   "type": "object"
+  }
+ },
+ {
+  "name": "activate_window",
+  "description": "\n    Activate a window (bring it to the foreground) by matching its title.\n\n    Args:\n        title_pattern: Pattern to match window title\n        use_regex: If True, treat the pattern as a regex, otherwise use fuzzy matching\n        threshold: Minimum score (0-100) required for a fuzzy match\n\n    Returns:\n        Success or error message\n    ",
+  "inputSchema": {
+   "properties": {
+    "title_pattern": {
+     "title": "Title Pattern",
+     "type": "string"
+    },
+    "use_regex": {
+     "default": false,
+     "title": "Use Regex",
+     "type": "boolean"
+    },
+    "threshold": {
+     "default": 60,
+     "title": "Threshold",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "title_pattern"
+   ],
+   "title": "activate_windowArguments",
+   "type": "object"
+  }
+ }
+]
